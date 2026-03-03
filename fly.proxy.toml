@@ -1,0 +1,20 @@
+app = "vault-proxy-3112"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile.vault-proxy"
+
+[env]
+FLY_ORG = "afk-ai-inc"
+FLY_APP = "vault-tenants-3112"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = 512
+
+[[services]]
+  internal_port = 8443
+  protocol = "udp"
+
+  [[services.ports]]
+    port = 8443

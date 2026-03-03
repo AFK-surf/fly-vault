@@ -1,0 +1,23 @@
+app = "fly-vault-3112"
+primary_region = "sjc"
+
+[env]
+VAULT_LISTEN = "fly-global-services:8443"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = 2048
+
+[mounts]
+  source = "vault_data"
+  destination = "/data"
+
+[[services]]
+  internal_port = 8443
+  protocol = "udp"
+
+  [[services.ports]]
+    port = 8443

@@ -1,0 +1,29 @@
+# Example tenant template for fly-vault-admin.
+# Usage:
+#   fly-vault-admin tenant create acme \
+#     --template ./examples/tenant_template.toml \
+#     --provision-token "replace-me"
+
+version = 1
+app = "vault-tenants"
+machine_count = 1
+
+[machine]
+name = "tenant-{{tenant_id}}-{{index}}"
+region = "ord"
+lease_ttl = 120
+
+[machine.config]
+image = "registry.fly.io/vault-tenants/init:2026-03-02"
+size = "shared-cpu-2x"
+
+[[machine.config.mounts]]
+path = "/data"
+name = "tvol_{{tenant_id}}_{{index}}"
+
+[machine.config.env]
+PROVISION_TOKEN = "{{provision_token}}"
+
+[metadata]
+role = "tenant-vm"
+environment = "prod"

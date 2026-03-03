@@ -1,0 +1,58 @@
+[workspace]
+members = [
+  "crates/protocol",
+  "crates/crypto",
+  "crates/init",
+  "crates/client",
+  "crates/admin",
+  "crates/proxy",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+fuser = { version = "0.17", default-features = false }
+hex = "0.4"
+http = "1"
+jsonwebtoken = "9"
+nix = { version = "0.29", features = ["mount", "sched", "signal", "fs", "user", "ioctl"] }
+once_cell = "1"
+rand = "0.8"
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rustls = "0.23"
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+url = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# QUIC stack
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
+
+# crypto primitives
+aes = "0.8"
+cipher = "0.4"
+
+# unix helpers
+libc = "0.2"
+nixpty = "0.2"
+portable-pty = "0.9"
+flate2 = "1"
+tar = "0.4"

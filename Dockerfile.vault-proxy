@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.86-bookworm AS builder
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --locked --release -p vault-proxy
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 vaultproxy
+
+COPY --from=builder /app/target/release/vault-proxy /usr/local/bin/vault-proxy
+
+USER 10001:10001
+EXPOSE 8443/udp
+ENTRYPOINT ["/usr/local/bin/vault-proxy"]

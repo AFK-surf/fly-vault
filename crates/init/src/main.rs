@@ -32,9 +32,6 @@ struct Args {
     #[arg(long, default_value = "/sbin/init")]
     init_binary: PathBuf,
 
-    #[arg(long, default_value_t = 20 * 1024 * 1024 * 1024_u64)]
-    image_size_bytes: u64,
-
     #[arg(long, default_value = "fly-vault-channel-binding")]
     channel_binding_label: String,
 
@@ -69,7 +66,6 @@ async fn main() -> anyhow::Result<()> {
         args.fuse_mount_dir.clone(),
         args.root_mount_dir.clone(),
         args.init_binary.clone(),
-        args.image_size_bytes,
         args.test_mode,
     )?;
 

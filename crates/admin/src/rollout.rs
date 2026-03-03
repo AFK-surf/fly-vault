@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use tokio::task::JoinSet;
 
-use crate::machines::{config_image, with_image, Machine, MachinesClient, UpdateMachineRequest};
+use crate::machines::{
+    config_image, with_image, with_metadata, Machine, MachinesClient, UpdateMachineRequest,
+};
 use crate::tenant::{
     list_managed_machines, verify_soak_window, wait_for_health, MANAGED_BY_KEY, MANAGED_BY_VALUE,
     TENANT_ID_KEY,
@@ -46,9 +48,9 @@ pub async fn update_image(client: &MachinesClient, options: UpdateImageOptions) 
         let target_tenants: HashSet<String> = options.tenants.iter().cloned().collect();
         machines.retain(|machine| {
             machine
-                .metadata
+                .metadata()
                 .get(TENANT_ID_KEY)
-                .map(|tenant| target_tenants.contains(tenant))
+                .map(|tenant| target_tenants.contains(tenant.as_str()))
                 .unwrap_or(false)
         });
     }
@@ -84,12 +86,19 @@ pub async fn update_image(client: &MachinesClient, options: UpdateImageOptions) 
 
     let mut updated = Vec::new();
 
+    println!(
+        "starting canary stage ({} of {} machines)",
+        canaries.len(),
+        canaries.len() + remaining.len()
+    );
+
     for snapshot in &canaries {
         println!(
-            "canary update {}/{}: {}",
+            "  canary {}/{}: {} (tenant {})",
             updated.len() + 1,
             canaries.len(),
-            snapshot.machine_id
+            snapshot.machine_id,
+            snapshot.tenant_id
         );
 
         if let Err(err) = update_one_machine(client, snapshot, &options.image, &options).await {
@@ -98,6 +107,19 @@ pub async fn update_image(client: &MachinesClient, options: UpdateImageOptions) 
         }
         updated.push(snapshot.clone());
     }
+
+    println!("canary stage passed");
+
+    if remaining.is_empty() {
+        println!("image update completed for {} machine(s)", updated.len());
+        return Ok(());
+    }
+
+    println!(
+        "starting rolling update for {} remaining machine(s) (concurrency={})",
+        remaining.len(),
+        options.concurrency
+    );
 
     let mut queue_by_tenant: BTreeMap<String, VecDeque<MachineSnapshot>> = BTreeMap::new();
     for snapshot in remaining {
@@ -179,17 +201,14 @@ fn validate_selectors(options: &UpdateImageOptions) -> Result<()> {
 }
 
 fn snapshot_from_machine(machine: Machine) -> Result<MachineSnapshot> {
-    let tenant_id = machine
-        .metadata
+    let metadata = machine.metadata();
+
+    let tenant_id = metadata
         .get(TENANT_ID_KEY)
         .cloned()
         .ok_or_else(|| anyhow!("machine {} missing {} metadata", machine.id, TENANT_ID_KEY))?;
 
-    let managed_by = machine
-        .metadata
-        .get(MANAGED_BY_KEY)
-        .map(String::as_str)
-        .unwrap_or("");
+    let managed_by = metadata.get(MANAGED_BY_KEY).map(String::as_str).unwrap_or("");
     if managed_by != MANAGED_BY_VALUE {
         return Err(anyhow!(
             "machine {} not managed by fly-vault-admin",
@@ -210,7 +229,7 @@ fn snapshot_from_machine(machine: Machine) -> Result<MachineSnapshot> {
         tenant_id,
         name: machine.name,
         region: machine.region,
-        metadata: machine.metadata,
+        metadata,
         config: machine.config,
         current_version,
         previous_image,
@@ -259,17 +278,19 @@ async fn update_one_machine(
 
     let mut operation_result = async {
         client
-            .cordon_machine(&snapshot.machine_id)
+            .cordon_machine(&snapshot.machine_id, Some(&lease.nonce))
             .await
             .with_context(|| format!("cordon machine {}", snapshot.machine_id))?;
 
+        let config = with_image(&snapshot.config, image)
+            .with_context(|| format!("set image for machine {}", snapshot.machine_id))?;
+        let config = with_metadata(&config, snapshot.metadata.clone())
+            .with_context(|| format!("set metadata for machine {}", snapshot.machine_id))?;
         let request = UpdateMachineRequest {
             name: snapshot.name.clone(),
             region: snapshot.region.clone(),
-            config: with_image(&snapshot.config, image)
-                .with_context(|| format!("set image for machine {}", snapshot.machine_id))?,
-            metadata: Some(snapshot.metadata.clone()),
-            current_version: snapshot.current_version.clone(),
+            config,
+            current_version: Some(snapshot.current_version.clone()),
         };
 
         client
@@ -291,7 +312,7 @@ async fn update_one_machine(
             .with_context(|| format!("soak window for machine {}", snapshot.machine_id))?;
 
         client
-            .uncordon_machine(&snapshot.machine_id)
+            .uncordon_machine(&snapshot.machine_id, Some(&lease.nonce))
             .await
             .with_context(|| format!("uncordon machine {}", snapshot.machine_id))?;
 
@@ -300,7 +321,7 @@ async fn update_one_machine(
     .await;
 
     if operation_result.is_err() {
-        let _ = client.uncordon_machine(&snapshot.machine_id).await;
+        let _ = client.uncordon_machine(&snapshot.machine_id, Some(&lease.nonce)).await;
     }
 
     let release_result = client
@@ -351,12 +372,12 @@ async fn rollback_one_machine(
         .await
         .with_context(|| format!("fetch machine {} for rollback", snapshot.machine_id))?;
 
-    let current_version = current.instance_id.clone().ok_or_else(|| {
+    let current_version = Some(current.instance_id.clone().ok_or_else(|| {
         anyhow!(
             "machine {} missing instance_id for rollback",
             snapshot.machine_id
         )
-    })?;
+    })?);
 
     let lease = client
         .create_lease(&snapshot.machine_id, options.lease_ttl_secs)
@@ -365,17 +386,20 @@ async fn rollback_one_machine(
 
     let mut operation_result = async {
         client
-            .cordon_machine(&snapshot.machine_id)
+            .cordon_machine(&snapshot.machine_id, Some(&lease.nonce))
             .await
             .with_context(|| format!("cordon machine {}", snapshot.machine_id))?;
 
+        let config =
+            with_image(&current.config, &snapshot.previous_image).with_context(|| {
+                format!("set rollback image for machine {}", snapshot.machine_id)
+            })?;
+        let config = with_metadata(&config, current.metadata())
+            .with_context(|| format!("set metadata for machine {}", snapshot.machine_id))?;
         let request = UpdateMachineRequest {
             name: current.name,
             region: current.region,
-            config: with_image(&current.config, &snapshot.previous_image).with_context(|| {
-                format!("set rollback image for machine {}", snapshot.machine_id)
-            })?,
-            metadata: Some(current.metadata),
+            config,
             current_version,
         };
 
@@ -398,7 +422,7 @@ async fn rollback_one_machine(
             .with_context(|| format!("soak window for machine {}", snapshot.machine_id))?;
 
         client
-            .uncordon_machine(&snapshot.machine_id)
+            .uncordon_machine(&snapshot.machine_id, Some(&lease.nonce))
             .await
             .with_context(|| format!("uncordon machine {}", snapshot.machine_id))?;
 
@@ -407,7 +431,7 @@ async fn rollback_one_machine(
     .await;
 
     if operation_result.is_err() {
-        let _ = client.uncordon_machine(&snapshot.machine_id).await;
+        let _ = client.uncordon_machine(&snapshot.machine_id, Some(&lease.nonce)).await;
     }
 
     let release_result = client

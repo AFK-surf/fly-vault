@@ -11,6 +11,14 @@ use tracing::{info, warn};
 
 pub type MachineMap = Arc<RwLock<HashMap<String, IpAddr>>>;
 
+#[derive(Clone, Debug)]
+pub struct MachineInfo {
+    pub state: String,
+    pub private_ip: Option<IpAddr>,
+}
+
+pub type FullMachineMap = Arc<RwLock<HashMap<String, MachineInfo>>>;
+
 #[derive(Deserialize)]
 struct MachineEntry {
     id: String,
@@ -18,22 +26,42 @@ struct MachineEntry {
     private_ip: Option<String>,
 }
 
-pub async fn refresh_once(client: &Client, api_token: &str, app: &str, map: &MachineMap) {
+pub async fn refresh_once(
+    client: &Client,
+    api_token: &str,
+    app: &str,
+    map: &MachineMap,
+    full_map: &FullMachineMap,
+) {
     match fetch_machines(client, api_token, app).await {
         Ok(entries) => {
             let mut new_map = HashMap::new();
+            let mut new_full = HashMap::new();
             for entry in entries {
-                if entry.state != "started" {
-                    continue;
-                }
-                if let Some(ip_str) = &entry.private_ip {
-                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                let ip = entry
+                    .private_ip
+                    .as_ref()
+                    .and_then(|s| s.parse::<IpAddr>().ok());
+                new_full.insert(
+                    entry.id.clone(),
+                    MachineInfo {
+                        state: entry.state.clone(),
+                        private_ip: ip,
+                    },
+                );
+                if entry.state == "started" {
+                    if let Some(ip) = ip {
                         new_map.insert(entry.id.clone(), ip);
                     }
                 }
             }
-            info!(count = new_map.len(), "refreshed machine map");
+            info!(
+                started = new_map.len(),
+                total = new_full.len(),
+                "refreshed machine map"
+            );
             *map.write().await = new_map;
+            *full_map.write().await = new_full;
         }
         Err(e) => {
             warn!(error = %e, "failed to refresh machine map, keeping previous");
@@ -60,15 +88,59 @@ async fn fetch_machines(
         .context("parse machines response")
 }
 
+pub async fn start_machine(
+    client: &Client,
+    api_token: &str,
+    app: &str,
+    machine_id: &str,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://api.machines.dev/v1/apps/{}/machines/{}/start",
+        app, machine_id
+    );
+    client
+        .post(&url)
+        .bearer_auth(api_token)
+        .send()
+        .await
+        .context("start machine request")?
+        .error_for_status()
+        .context("start machine error status")?;
+    Ok(())
+}
+
+pub async fn wait_for_started(
+    client: &Client,
+    api_token: &str,
+    app: &str,
+    machine_id: &str,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://api.machines.dev/v1/apps/{}/machines/{}/wait",
+        app, machine_id
+    );
+    client
+        .get(&url)
+        .bearer_auth(api_token)
+        .query(&[("state", "started"), ("timeout", "30")])
+        .send()
+        .await
+        .context("wait for machine started")?
+        .error_for_status()
+        .context("wait for started error status")?;
+    Ok(())
+}
+
 pub async fn poll_machines(
     client: Client,
     api_token: String,
     app: String,
     map: MachineMap,
+    full_map: FullMachineMap,
     interval: Duration,
 ) {
     loop {
         tokio::time::sleep(interval).await;
-        refresh_once(&client, &api_token, &app, &map).await;
+        refresh_once(&client, &api_token, &app, &map, &full_map).await;
     }
 }

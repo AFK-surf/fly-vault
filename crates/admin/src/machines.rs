@@ -85,26 +85,45 @@ impl MachinesClient {
         state: &str,
         timeout: Duration,
         instance_id: Option<&str>,
-    ) -> Result<Machine> {
-        let mut query: Vec<(String, String)> = vec![
-            ("state".to_string(), state.to_string()),
-            ("timeout".to_string(), timeout.as_secs().to_string()),
-        ];
-        if let Some(instance_id) = instance_id {
-            query.push(("instance_id".to_string(), instance_id.to_string()));
-        }
+    ) -> Result<()> {
+        // The API enforces timeout in [1s, 60s], so loop in 60s chunks.
+        let mut remaining = timeout.as_secs().max(1);
+        loop {
+            let chunk = remaining.min(60);
+            let mut query: Vec<(String, String)> = vec![
+                ("state".to_string(), state.to_string()),
+                ("timeout".to_string(), chunk.to_string()),
+            ];
+            if let Some(instance_id) = instance_id {
+                query.push(("instance_id".to_string(), instance_id.to_string()));
+            }
 
-        send(
-            self.http
-                .get(self.machine_path(machine_id, "wait"))
-                .bearer_auth(&self.token)
-                .query(&query),
-        )
-        .await
+            let result = send_empty(
+                self.http
+                    .get(self.machine_path(machine_id, "wait"))
+                    .bearer_auth(&self.token)
+                    .query(&query),
+            )
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) if remaining > chunk => {
+                    // 408 means the server-side poll expired — retry with remaining time.
+                    let msg = format!("{}", err);
+                    if msg.contains("408") {
+                        remaining -= chunk;
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
-    pub async fn stop_machine(&self, machine_id: &str) -> Result<Machine> {
-        send(
+    pub async fn stop_machine(&self, machine_id: &str) -> Result<()> {
+        send_empty(
             self.http
                 .post(self.machine_path(machine_id, "stop"))
                 .bearer_auth(&self.token)
@@ -123,34 +142,47 @@ impl MachinesClient {
         .await
     }
 
-    pub async fn cordon_machine(&self, machine_id: &str) -> Result<()> {
-        send_empty(
-            self.http
-                .post(self.machine_path(machine_id, "cordon"))
-                .bearer_auth(&self.token)
-                .json(&json!({})),
-        )
-        .await
+    pub async fn cordon_machine(
+        &self,
+        machine_id: &str,
+        lease_nonce: Option<&str>,
+    ) -> Result<()> {
+        let mut req = self
+            .http
+            .post(self.machine_path(machine_id, "cordon"))
+            .bearer_auth(&self.token)
+            .json(&json!({}));
+        if let Some(nonce) = lease_nonce {
+            req = req.header("fly-machine-lease-nonce", nonce);
+        }
+        send_empty(req).await
     }
 
-    pub async fn uncordon_machine(&self, machine_id: &str) -> Result<()> {
-        send_empty(
-            self.http
-                .post(self.machine_path(machine_id, "uncordon"))
-                .bearer_auth(&self.token)
-                .json(&json!({})),
-        )
-        .await
+    pub async fn uncordon_machine(
+        &self,
+        machine_id: &str,
+        lease_nonce: Option<&str>,
+    ) -> Result<()> {
+        let mut req = self
+            .http
+            .post(self.machine_path(machine_id, "uncordon"))
+            .bearer_auth(&self.token)
+            .json(&json!({}));
+        if let Some(nonce) = lease_nonce {
+            req = req.header("fly-machine-lease-nonce", nonce);
+        }
+        send_empty(req).await
     }
 
     pub async fn create_lease(&self, machine_id: &str, ttl_secs: u32) -> Result<MachineLease> {
-        send(
+        let response: LeaseResponse = send(
             self.http
                 .post(self.machine_path(machine_id, "lease"))
                 .bearer_auth(&self.token)
                 .json(&json!({"ttl": ttl_secs})),
         )
-        .await
+        .await?;
+        Ok(response.data)
     }
 
     pub async fn release_lease(&self, machine_id: &str, lease_nonce: &str) -> Result<()> {
@@ -237,8 +269,6 @@ pub struct CreateMachineRequest {
     pub region: Option<String>,
     pub config: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_ttl: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_launch: Option<bool>,
@@ -270,8 +300,12 @@ pub struct UpdateMachineRequest {
     pub region: Option<String>,
     pub config: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, String>>,
-    pub current_version: String,
+    pub current_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeaseResponse {
+    pub data: MachineLease,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -298,11 +332,26 @@ pub struct Machine {
     #[serde(default)]
     pub image_ref: Option<ImageRef>,
     #[serde(default)]
-    pub metadata: HashMap<String, String>,
-    #[serde(default)]
     pub config: Value,
     #[serde(default)]
     pub checks: Value,
+}
+
+impl Machine {
+    /// Extract metadata from `config.metadata`. The API returns metadata
+    /// inside the config object, not as a top-level machine field.
+    pub fn metadata(&self) -> HashMap<String, String> {
+        self.config
+            .as_object()
+            .and_then(|obj| obj.get("metadata"))
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -313,6 +362,18 @@ pub struct ImageRef {
     pub tag: Option<String>,
     #[serde(default)]
     pub digest: Option<String>,
+}
+
+pub fn with_metadata(config: &Value, metadata: HashMap<String, String>) -> Result<Value> {
+    let mut out = config.clone();
+    let obj = out
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("machine config is not an object"))?;
+    obj.insert(
+        "metadata".to_string(),
+        serde_json::to_value(metadata).context("serialize metadata")?,
+    );
+    Ok(out)
 }
 
 pub fn config_image(config: &Value) -> Option<String> {

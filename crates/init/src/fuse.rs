@@ -420,20 +420,48 @@ impl Filesystem for CryptoFs {
     }
 }
 
-pub fn ensure_image_file(path: &Path, bytes: u64) -> Result<()> {
-    if path.exists() {
+pub fn ensure_image_file(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create {}", parent.display()))?;
+
+    let existing_size = if path.exists() {
+        std::fs::metadata(path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .len()
+    } else {
+        0
+    };
+
+    let stat = nix::sys::statvfs::statvfs(parent)
+        .with_context(|| format!("statvfs {}", parent.display()))?;
+    let free_bytes = stat.blocks_available() as u64 * stat.fragment_size() as u64;
+    let target =
+        (existing_size + free_bytes * 95 / 100) / SECTOR_SIZE as u64 * SECTOR_SIZE as u64;
+
+    if target <= existing_size {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+
+    tracing::info!(existing = existing_size, target, "extending encrypted image");
+
+    if existing_size == 0 {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("create encrypted image {}", path.display()))?;
+        file.set_len(target)
+            .with_context(|| format!("preallocate encrypted image {}", path.display()))?;
+    } else {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open encrypted image for extension {}", path.display()))?;
+        file.set_len(target)
+            .with_context(|| format!("extend encrypted image to {target} bytes"))?;
     }
-    let file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("create encrypted image {}", path.display()))?;
-    file.set_len(bytes)
-        .with_context(|| format!("preallocate encrypted image {}", path.display()))?;
+
     Ok(())
 }

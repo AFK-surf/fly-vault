@@ -2,14 +2,14 @@ mod machines;
 mod proxy;
 mod session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -59,12 +59,21 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let machine_map: machines::MachineMap = Arc::new(RwLock::new(HashMap::new()));
+    let full_machine_map: machines::FullMachineMap = Arc::new(RwLock::new(HashMap::new()));
     let sessions: session::SessionMap = Arc::new(RwLock::new(HashMap::new()));
+    let starting: proxy::StartingSet = Arc::new(Mutex::new(HashSet::new()));
 
     let http_client = reqwest::Client::new();
 
     // Initial machine map fetch before accepting traffic
-    machines::refresh_once(&http_client, &fly_api_token, &fly_app, &machine_map).await;
+    machines::refresh_once(
+        &http_client,
+        &fly_api_token,
+        &fly_app,
+        &machine_map,
+        &full_machine_map,
+    )
+    .await;
 
     let frontend = Arc::new(
         UdpSocket::bind(format!("fly-global-services:{}", args.port))
@@ -78,17 +87,23 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::select! {
         _ = machines::poll_machines(
-            http_client,
-            fly_api_token,
-            fly_app,
+            http_client.clone(),
+            fly_api_token.clone(),
+            fly_app.clone(),
             machine_map.clone(),
+            full_machine_map.clone(),
             refresh_interval,
         ) => {}
         _ = proxy::run_proxy(
             frontend,
             machine_map,
+            full_machine_map,
             sessions.clone(),
             args.backend_port,
+            http_client,
+            fly_api_token,
+            fly_app,
+            starting,
         ) => {}
         _ = session::cleanup_sessions(sessions, session_timeout) => {}
     }

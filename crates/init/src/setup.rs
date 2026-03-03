@@ -20,7 +20,6 @@ pub struct SetupManager {
     fuse_mount_dir: PathBuf,
     root_mount_dir: PathBuf,
     init_binary: PathBuf,
-    image_size_bytes: u64,
     encrypted_img: PathBuf,
     provisioned_marker: PathBuf,
     test_mode: bool,
@@ -40,7 +39,6 @@ impl SetupManager {
         fuse_mount_dir: PathBuf,
         root_mount_dir: PathBuf,
         init_binary: PathBuf,
-        image_size_bytes: u64,
         test_mode: bool,
     ) -> Result<Self> {
         let encrypted_img = data_dir.join("encrypted.img");
@@ -49,7 +47,6 @@ impl SetupManager {
             fuse_mount_dir,
             root_mount_dir,
             init_binary,
-            image_size_bytes,
             encrypted_img,
             provisioned_marker,
             test_mode,
@@ -96,8 +93,7 @@ impl SetupManager {
         }
 
         let encrypted_img = self.encrypted_img.clone();
-        let image_size_bytes = self.image_size_bytes;
-        task::spawn_blocking(move || ensure_image_file(&encrypted_img, image_size_bytes))
+        task::spawn_blocking(move || ensure_image_file(&encrypted_img))
             .await
             .context("join ensure image file")??;
 
@@ -149,6 +145,11 @@ impl SetupManager {
             None::<&str>,
         )
         .context("mount decrypted filesystem")?;
+
+        run_cmd(
+            Command::new("resize2fs").arg(&loop_device),
+            "resize2fs",
+        )?;
 
         if let Some(data) = rootfs_tarball {
             extract_rootfs(&self.root_mount_dir, &data)?;

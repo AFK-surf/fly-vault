@@ -83,6 +83,23 @@ pub async fn connect_and_run(
         "attestation verified"
     );
 
+    let expected_issuer = format!("https://oidc.fly.io/{}", cfg.org);
+    if claims.iss != expected_issuer {
+        return Err(anyhow!(
+            "attestation org mismatch: issuer={} expected={}",
+            claims.iss,
+            expected_issuer
+        ));
+    }
+
+    if claims.app_name != cfg.app {
+        return Err(anyhow!(
+            "attestation app mismatch: app_name={} expected={}",
+            claims.app_name,
+            cfg.app
+        ));
+    }
+
     let api_token = cfg
         .fly_api_token
         .clone()
@@ -253,11 +270,11 @@ fn insecure_client_config() -> Result<ClientConfig> {
     transport.initial_mtu(1200);
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(120)
+        std::time::Duration::from_secs(60)
             .try_into()
             .context("idle timeout")?,
     ));
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)

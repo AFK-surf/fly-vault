@@ -7,8 +7,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::machines::{
-    checks_are_passing, config_image, mounted_volume_ids, CreateMachineRequest,
-    CreateVolumeRequest, Machine, MachinesClient,
+    checks_are_passing, config_image, mounted_volume_ids, with_metadata, CreateMachineRequest,
+    CreateVolumeRequest, ImageRef, Machine, MachinesClient,
 };
 use crate::template::{load_template, render_template};
 
@@ -56,11 +56,12 @@ pub async fn create_tenant(
         metadata.insert(MANAGED_BY_KEY.to_string(), MANAGED_BY_VALUE.to_string());
         metadata.insert(TEMPLATE_KEY.to_string(), template_label.to_string());
 
+        let config = with_metadata(&machine.config, metadata)
+            .context("set metadata on machine config")?;
         let mut request = CreateMachineRequest {
             name: machine.name,
             region: machine.region,
-            config: machine.config,
-            metadata: Some(metadata),
+            config,
             lease_ttl: machine.lease_ttl,
             skip_launch: machine.skip_launch,
             skip_service_registration: machine.skip_service_registration,
@@ -305,7 +306,7 @@ pub async fn delete_tenant(
     let mut errors = Vec::new();
 
     for machine in &machines {
-        if let Err(err) = client.cordon_machine(&machine.id).await {
+        if let Err(err) = client.cordon_machine(&machine.id, None).await {
             errors.push(format!("cordon {}: {}", machine.id, err));
         }
 
@@ -372,19 +373,18 @@ pub async fn list_managed_machines(
     let mut machines = client.list_machines(&query).await?;
 
     machines.retain(|machine| {
-        machine
-            .metadata
-            .get(MANAGED_BY_KEY)
+        let md = machine.metadata();
+        md.get(MANAGED_BY_KEY)
             .map(|value| value == MANAGED_BY_VALUE)
             .unwrap_or(false)
-            && machine.metadata.contains_key(TENANT_ID_KEY)
+            && md.contains_key(TENANT_ID_KEY)
             && machine.state != "destroyed"
     });
 
     if let Some(tenant_id) = tenant_filter {
         machines.retain(|machine| {
             machine
-                .metadata
+                .metadata()
                 .get(TENANT_ID_KEY)
                 .map(|value| value == tenant_id)
                 .unwrap_or(false)
@@ -410,18 +410,29 @@ struct TenantSummary {
 #[derive(Debug, Serialize)]
 struct TenantMachine {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     state: String,
     region: Option<String>,
     instance_id: Option<String>,
-    image: Option<String>,
-    volumes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
     updated_at: Option<String>,
+    image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_ref: Option<ImageRef>,
+    volumes: Vec<String>,
+    config: Value,
+    #[serde(skip_serializing_if = "Value::is_null")]
+    checks: Value,
 }
 
 fn group_machines_by_tenant(machines: Vec<Machine>) -> Vec<TenantSummary> {
     let mut grouped: BTreeMap<String, Vec<Machine>> = BTreeMap::new();
     for machine in machines {
-        if let Some(tenant_id) = machine.metadata.get(TENANT_ID_KEY) {
+        if let Some(tenant_id) = machine.metadata().get(TENANT_ID_KEY).cloned() {
             grouped
                 .entry(tenant_id.to_string())
                 .or_default()
@@ -480,12 +491,18 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
         let volumes = mounted_volume_ids(&machine);
         machine_rows.push(TenantMachine {
             id: machine.id,
+            name: machine.name,
             state: machine.state,
             region: machine.region,
             instance_id: machine.instance_id,
-            image,
-            volumes,
+            private_ip: machine.private_ip,
+            created_at: machine.created_at,
             updated_at: machine.updated_at,
+            image,
+            image_ref: machine.image_ref,
+            volumes,
+            config: machine.config,
+            checks: machine.checks,
         });
     }
 

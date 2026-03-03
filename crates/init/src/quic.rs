@@ -65,11 +65,11 @@ fn build_server_config() -> Result<ServerConfig> {
     transport.initial_mtu(1200);
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_idle_timeout(Some(
-        Duration::from_secs(120)
+        Duration::from_secs(60)
             .try_into()
             .context("idle timeout")?,
     ));
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    transport.keep_alive_interval(Some(Duration::from_secs(5)));
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(tls).context("build quic rustls server config")?,

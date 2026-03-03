@@ -407,7 +407,6 @@ fn args_for_test(temp: &TempDir, port: u16, locked: bool) -> Result<Args> {
         fuse_mount_dir: fuse_dir,
         root_mount_dir: root_dir,
         init_binary: "/sbin/init".into(),
-        image_size_bytes: 20 * 1024 * 1024,
         channel_binding_label: "fly-vault-channel-binding".to_string(),
         test_mode: true,
     })
@@ -422,7 +421,6 @@ async fn shared_state_for_args(
         args.fuse_mount_dir.clone(),
         args.root_mount_dir.clone(),
         args.init_binary.clone(),
-        args.image_size_bytes,
         args.test_mode,
     )?;
     let vm_state = setup.detect_state()?;

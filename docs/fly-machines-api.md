@@ -471,7 +471,7 @@ If the machine is leased, the `fly-machine-lease-nonce` header is required.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `state` | string | `"started"` | Target state: `"started"`, `"stopped"`, `"suspended"`, `"destroyed"`. |
-| `timeout` | int | `60` | Seconds to wait before timing out. |
+| `timeout` | int | `60` | Seconds to wait before timing out. **Must be in [1, 60].** |
 | `instance_id` | string | - | Target a specific version. Required when waiting for `"stopped"` state. |
 
 ### Delete Machine (DELETE /v1/apps/{app_name}/machines/{machine_id})
@@ -479,6 +479,104 @@ If the machine is leased, the `fly-machine-lease-nonce` header is required.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `force` | bool | Force-stop the machine if it is currently running. |
+
+---
+
+## Action Endpoint Responses
+
+The start, stop, suspend, wait, cordon, and uncordon endpoints return simple acknowledgments, **not** Machine objects.
+
+### Stop Machine (POST .../stop)
+
+Request body (optional):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `signal` | string | `"SIGINT"` | Signal to send to the machine process. |
+| `timeout` | int | - | Seconds to wait before sending SIGKILL. |
+
+Response: HTTP 200
+
+```json
+{"ok": true}
+```
+
+### Wait for State (GET .../wait)
+
+Response: HTTP 200 when the machine reaches the requested state within the timeout.
+
+```json
+{"ok": true}
+```
+
+Returns HTTP 408 if the timeout expires before reaching the desired state.
+
+### Start / Cordon / Uncordon
+
+Response: HTTP 200
+
+```json
+{"ok": true}
+```
+
+---
+
+## Lease Endpoints
+
+### Create Lease (POST .../lease)
+
+Request body:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ttl` | int | Lease duration in seconds. |
+| `description` | string | Optional description. |
+
+Response: HTTP 201. The lease data is nested under a `data` wrapper:
+
+```json
+{
+  "status": "success",
+  "data": {
+    "nonce": "5c35f65c9f95",
+    "expires_at": 1708569778,
+    "owner": "hello@fly.io",
+    "description": "",
+    "version": "01HQ73A7BFFDF1B6WMGHFZZ4E7"
+  }
+}
+```
+
+Use the `nonce` from `data.nonce` in the `fly-machine-lease-nonce` header for subsequent requests.
+
+### Release Lease (DELETE .../lease)
+
+Requires the `fly-machine-lease-nonce` header. Response: HTTP 200 with empty body.
+
+---
+
+## Volume Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/apps/{app_name}/volumes` | Create a volume |
+| DELETE | `/v1/apps/{app_name}/volumes/{volume_id}` | Delete a volume |
+
+### Create Volume (POST /v1/apps/{app_name}/volumes)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string (required) | - | Volume name. |
+| `region` | string | - | Region to create the volume in. |
+| `size_gb` | int | `3` | Size in gigabytes. |
+| `encrypted` | bool | `true` | Whether to encrypt the volume. |
+| `snapshot_id` | string | - | Snapshot ID to restore from. |
+| `source_volume_id` | string | - | Source volume ID for a fork. |
+| `require_unique_zone` | bool | `false` | Provision on hardware without duplicate volume names. |
+| `auto_backup_enabled` | bool | `true` | Enable automatic daily snapshots. |
+| `snapshot_retention` | int | - | Days to retain snapshots (1-60). |
+
+Response: HTTP 200 with volume object containing at minimum `id` (string).
 
 ---
 
@@ -500,4 +598,6 @@ If the machine is leased, the `fly-machine-lease-nonce` header is required.
 - **Closed by default**: Machines are not accessible from the public internet unless `services` are configured.
 - **Capacity failures**: Create requests may fail if capacity is unavailable. The caller is responsible for retry logic.
 - **Stopped vs. Suspended**: Stopped machines reset to their original state on next start. Suspended machines attempt to resume from a memory snapshot.
-- **Leasing**: Use the lease endpoints to acquire an exclusive lock on a machine. When a machine is leased, the `fly-machine-lease-nonce` header must be included in update and lease release requests.
+- **Leasing**: Use the lease endpoints to acquire an exclusive lock on a machine. When a machine is leased, the `fly-machine-lease-nonce` header must be included in update and lease release requests. The lease create response nests data under a `data` key.
+- **Metadata placement**: Machine metadata belongs inside `config.metadata`, not as a top-level field in create/update requests. The separate metadata endpoint (`POST .../metadata/{key}`) can update individual keys without a full config update.
+- **Action endpoint responses**: Stop, start, wait, cordon, and uncordon return `{"ok": true}`, not Machine objects. Do not attempt to deserialize their responses as machines.

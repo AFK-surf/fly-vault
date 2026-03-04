@@ -1,11 +1,11 @@
 use crate::fuse::{ensure_image_file, mount_crypto_fs, CryptoMount};
 use anyhow::{anyhow, Context, Result};
 use crypto::XtsKey;
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount, umount2, MntFlags, MsFlags};
 use nix::sched::{clone, CloneFlags};
-use nix::sys::signal::Signal;
+use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag};
-use nix::unistd::{chdir, chroot, execv, Pid};
+use nix::unistd::{chdir, execv, pivot_root, Pid};
 use protocol::VmState;
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::task;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct SetupManager {
@@ -190,6 +190,65 @@ impl SetupManager {
 
         Ok(())
     }
+
+    /// Graceful shutdown: kill all user processes, wait for them to exit,
+    /// then unmount the decrypted rootfs and detach the loop device.
+    pub async fn shutdown(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            info!("shutdown: no active runtime, nothing to tear down");
+            return;
+        };
+
+        // SIGKILL the inner init; the kernel kills all other processes in its
+        // PID namespace once PID 1 of that namespace exits.
+        if let Some(pid) = runtime._inner_init_pid {
+            info!(pid = pid.as_raw(), "shutdown: sending SIGKILL to inner init");
+            let _ = kill(pid, Signal::SIGKILL);
+            let _ = task::spawn_blocking(move || {
+                let _ = waitpid(pid, None);
+                info!(pid = pid.as_raw(), "shutdown: inner init reaped");
+            })
+            .await;
+        }
+
+        if self.test_mode {
+            return;
+        }
+
+        let root = self.root_mount_dir.clone();
+        let loop_dev = runtime._loop_device.clone();
+        let _ = task::spawn_blocking(move || {
+            // The child's mount namespace (CLONE_NEWNS) was torn down with the
+            // inner init process, so all submounts (dev, tmp, proc, sys) are
+            // already gone. We only need to unmount the rootfs itself.
+            info!(path = %root.display(), "shutdown: unmounting rootfs");
+            if let Err(err) = umount(&root) {
+                warn!(error = ?err, "shutdown: unmount rootfs failed");
+            } else {
+                info!("shutdown: rootfs unmounted");
+            }
+
+            info!(device = %loop_dev.display(), "shutdown: detaching loop device");
+            match Command::new("losetup").arg("-d").arg(&loop_dev).status() {
+                Ok(s) if s.success() => {
+                    info!(device = %loop_dev.display(), "shutdown: loop device detached");
+                }
+                Ok(s) => {
+                    warn!(device = %loop_dev.display(), code = ?s.code(), "shutdown: losetup -d exited non-zero");
+                }
+                Err(err) => {
+                    warn!(device = %loop_dev.display(), error = ?err, "shutdown: losetup detach failed");
+                }
+            }
+        })
+        .await;
+
+        // Drop the FUSE mount last; its BackgroundSession::drop unmounts the
+        // FUSE filesystem.
+        info!("shutdown: dropping FUSE crypto mount");
+        drop(runtime._mount);
+        info!("shutdown: complete");
+    }
 }
 
 fn attach_loop_device(backing_file: &Path) -> Result<PathBuf> {
@@ -229,8 +288,6 @@ fn extract_rootfs(target_root: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn launch_namespaced_init(root: &Path, init_binary: &Path) -> Result<Pid> {
-    prepare_mounts(root)?;
-
     let mut stack = vec![0u8; 1024 * 1024];
     let root = root.to_path_buf();
     let init_binary = init_binary.to_path_buf();
@@ -243,16 +300,40 @@ fn launch_namespaced_init(root: &Path, init_binary: &Path) -> Result<Pid> {
         0
     });
 
-    let flags = CloneFlags::CLONE_NEWPID;
+    // CLONE_NEWPID: child becomes PID 1 in a new PID namespace so killing it
+    // reaps all of its descendants automatically.
+    // CLONE_NEWNS: child gets its own mount namespace so bind-mounts set up in
+    // child_bootstrap (dev, tmp, proc, sys) stay confined to that namespace and
+    // are torn down by the kernel when the namespace exits — the parent can then
+    // umount the rootfs without EBUSY.
+    let flags = CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS;
     let pid = unsafe { clone(cb, &mut stack, flags, Some(Signal::SIGCHLD as i32)) }
-        .context("clone pid namespace")?;
+        .context("clone pid+mount namespace")?;
 
     Ok(pid)
 }
 
 fn child_bootstrap(root: &Path, init_binary: &Path) -> Result<()> {
-    chroot(root).with_context(|| format!("chroot {}", root.display()))?;
-    chdir("/").context("chdir / after chroot")?;
+    // All mounts below are in the child's private mount namespace and are
+    // destroyed automatically when this process (and namespace) exits.
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .context("set mount propagation private")?;
+
+    prepare_mounts(root)?;
+
+    let old_root = root.join(".old_root");
+    fs::create_dir_all(&old_root).with_context(|| format!("create {}", old_root.display()))?;
+    pivot_root(root, &old_root)
+        .with_context(|| format!("pivot_root {} {}", root.display(), old_root.display()))?;
+    chdir("/").context("chdir / after pivot_root")?;
+    umount2("/.old_root", MntFlags::MNT_DETACH).context("detach old root")?;
+    fs::remove_dir("/.old_root").context("remove /.old_root")?;
 
     mount(
         Some("proc"),

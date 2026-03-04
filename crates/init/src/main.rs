@@ -7,10 +7,12 @@ mod setup;
 #[cfg(test)]
 mod tests;
 
+use anyhow::Context;
 use clap::Parser;
 use protocol::VmState;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -87,5 +89,21 @@ async fn main() -> anyhow::Result<()> {
         key_hash: None,
     }));
 
-    quic::serve(args, shared).await
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGTERM handler")?;
+
+    tokio::select! {
+        result = quic::serve(args, Arc::clone(&shared)) => result?,
+        _ = sigterm.recv() => {
+            info!("SIGTERM received, shutting down");
+        }
+        _ = sigint.recv() => {
+            info!("SIGINT received, shutting down");
+        }
+    }
+
+    info!("running shutdown");
+    shared.lock().await.setup.shutdown().await;
+    info!("shutdown complete, exiting");
+    Ok(())
 }

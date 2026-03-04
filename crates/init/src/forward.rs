@@ -82,15 +82,7 @@ pub async fn handle_console_stream(
     let slave_raw = slave_fd.as_raw_fd();
     let mut cmd = if let Some(pid) = inner_pid {
         let mut c = Command::new("nsenter");
-        c.args([
-            "--target",
-            &pid.as_raw().to_string(),
-            "--pid",
-            &format!("--root={}", root_dir.display()),
-            "--wd=/",
-            shell,
-            "-l",
-        ]);
+        c.args(["-a", "-t", &pid.as_raw().to_string(), "--wd=/mnt/root", shell, "-l"]);
         c
     } else {
         let mut c = Command::new("chroot");

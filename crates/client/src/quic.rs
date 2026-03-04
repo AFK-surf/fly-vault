@@ -162,12 +162,16 @@ pub async fn connect_and_run(
         }
     }
 
-    let console_conn = conn.clone();
-    tokio::spawn(async move {
-        let _ = console::run_console(console_conn).await;
-    });
+    if forwards.is_empty() {
+        console::run_console(conn).await?;
+    } else {
+        let console_conn = conn.clone();
+        tokio::spawn(async move {
+            let _ = console::run_console(console_conn).await;
+        });
 
-    forward::run_local_forwarders(conn, forwards).await?;
+        forward::run_local_forwarders(conn, forwards).await?;
+    }
 
     let _ = vault_name;
     Ok(())

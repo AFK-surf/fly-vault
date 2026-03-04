@@ -146,10 +146,7 @@ impl SetupManager {
         )
         .context("mount decrypted filesystem")?;
 
-        run_cmd(
-            Command::new("resize2fs").arg(&loop_device),
-            "resize2fs",
-        )?;
+        run_cmd(Command::new("resize2fs").arg(&loop_device), "resize2fs")?;
 
         if let Some(data) = rootfs_tarball {
             extract_rootfs(&self.root_mount_dir, &data)?;
@@ -202,7 +199,10 @@ impl SetupManager {
         // SIGKILL the inner init; the kernel kills all other processes in its
         // PID namespace once PID 1 of that namespace exits.
         if let Some(pid) = runtime._inner_init_pid {
-            info!(pid = pid.as_raw(), "shutdown: sending SIGKILL to inner init");
+            info!(
+                pid = pid.as_raw(),
+                "shutdown: sending SIGKILL to inner init"
+            );
             let _ = kill(pid, Signal::SIGKILL);
             let _ = task::spawn_blocking(move || {
                 let _ = waitpid(pid, None);

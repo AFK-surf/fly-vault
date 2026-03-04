@@ -142,11 +142,7 @@ impl MachinesClient {
         .await
     }
 
-    pub async fn cordon_machine(
-        &self,
-        machine_id: &str,
-        lease_nonce: Option<&str>,
-    ) -> Result<()> {
+    pub async fn cordon_machine(&self, machine_id: &str, lease_nonce: Option<&str>) -> Result<()> {
         let mut req = self
             .http
             .post(self.machine_path(machine_id, "cordon"))

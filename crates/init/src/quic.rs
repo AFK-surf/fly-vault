@@ -65,9 +65,7 @@ fn build_server_config() -> Result<ServerConfig> {
     transport.initial_mtu(1200);
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_idle_timeout(Some(
-        Duration::from_secs(60)
-            .try_into()
-            .context("idle timeout")?,
+        Duration::from_secs(60).try_into().context("idle timeout")?,
     ));
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
 

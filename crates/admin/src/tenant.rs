@@ -56,8 +56,8 @@ pub async fn create_tenant(
         metadata.insert(MANAGED_BY_KEY.to_string(), MANAGED_BY_VALUE.to_string());
         metadata.insert(TEMPLATE_KEY.to_string(), template_label.to_string());
 
-        let config = with_metadata(&machine.config, metadata)
-            .context("set metadata on machine config")?;
+        let config =
+            with_metadata(&machine.config, metadata).context("set metadata on machine config")?;
         let mut request = CreateMachineRequest {
             name: machine.name,
             region: machine.region,

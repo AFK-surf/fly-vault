@@ -27,6 +27,9 @@ enum Command {
         vault: String,
         #[arg(long = "forward")]
         forward: Vec<String>,
+        /// Enforce full attestation checks (audience/digest + machine config via Fly API)
+        #[arg(long)]
+        strict: bool,
         /// Re-provision the vault with a new rootfs while in locked state
         #[arg(long)]
         reprovision: bool,
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
         Command::Connect {
             vault,
             forward,
+            strict,
             reprovision,
         } => {
             let (config_path, mut cfg_file) = load_config_file()?;
@@ -91,7 +95,7 @@ async fn main() -> Result<()> {
                 forward
             };
 
-            quic::connect_and_run(vault, vault_cfg, key, forwards, reprovision).await?;
+            quic::connect_and_run(vault, vault_cfg, key, forwards, reprovision, strict).await?;
         }
         Command::Keygen { vault } => {
             let path = key_path(&vault)?;

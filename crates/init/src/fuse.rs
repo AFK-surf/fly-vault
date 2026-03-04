@@ -422,8 +422,7 @@ impl Filesystem for CryptoFs {
 
 pub fn ensure_image_file(path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("/"));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
 
     let existing_size = if path.exists() {
         std::fs::metadata(path)
@@ -436,14 +435,17 @@ pub fn ensure_image_file(path: &Path) -> Result<()> {
     let stat = nix::sys::statvfs::statvfs(parent)
         .with_context(|| format!("statvfs {}", parent.display()))?;
     let free_bytes = stat.blocks_available() as u64 * stat.fragment_size() as u64;
-    let target =
-        (existing_size + free_bytes * 95 / 100) / SECTOR_SIZE as u64 * SECTOR_SIZE as u64;
+    let target = (existing_size + free_bytes * 95 / 100) / SECTOR_SIZE as u64 * SECTOR_SIZE as u64;
 
     if target <= existing_size {
         return Ok(());
     }
 
-    tracing::info!(existing = existing_size, target, "extending encrypted image");
+    tracing::info!(
+        existing = existing_size,
+        target,
+        "extending encrypted image"
+    );
 
     if existing_size == 0 {
         let file = OpenOptions::new()

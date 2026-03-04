@@ -113,6 +113,7 @@ Example structure:
 address = "[fdaa:x:x::x]:8443"
 org = "my-org"
 app = "my-dev-vault"
+# Strict mode only:
 fly_api_token = "fo1_..."
 allowed_digests = ["sha256:..."]
 forward = ["8080:localhost:8080"]
@@ -130,10 +131,16 @@ Key path:
 ```bash
 fly-vault connect <vault-name>
 fly-vault connect <vault-name> --forward 3000:localhost:3000
+fly-vault connect <vault-name> --strict
 fly-vault keygen <vault-name>
 fly-vault allow <vault-name> sha256:<digest>
 fly-vault build
 ```
+
+Attestation modes:
+
+- Default (relaxed): verifies Fly OIDC JWT signature/key material and enforces `org` (`iss`), channel binding (`aud` against local TLS exporter), and `app` (`app_name`). Does not call Fly Machines API.
+- `--strict`: additionally enforces image digest allowlist (`allowed_digests`) and machine config checks via Fly Machines API (`fly_api_token` or `FLY_API_TOKEN`).
 
 For local development via Cargo:
 

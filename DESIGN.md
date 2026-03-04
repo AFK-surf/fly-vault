@@ -17,7 +17,7 @@ can access the VM or its persistent data — not even the Fly account owner.
 
 | Property | Mechanism |
 |---|---|
-| Authenticity | Fly OIDC attestation of `image_digest` + machine config verification, channel-bound to TLS session |
+| Authenticity | Fly OIDC attestation channel-bound to TLS (`aud`); default checks `iss` + `aud` + `app_name`, strict mode additionally checks `image_digest` + machine config |
 | Confidentiality of data at rest | AES-256-XTS encrypted volume; key never leaves the client except over an attested channel |
 | Confidentiality of data in transit | QUIC (TLS 1.3) |
 | Integrity of the VM image | `image_digest` in OIDC token checked against a client-side allowlist |
@@ -618,11 +618,11 @@ app = "my-dev-vault"                 # Fly app name (for Machines API)
 # to each outgoing UDP datagram as described in §12.3.
 machine_id = "e2865d95f47d38"
 
-# Fly API token (read-only access to the app, for config verification)
+# Fly API token (strict mode only: read-only access to the app, for config verification)
 # Can also be set via FLY_API_TOKEN env var
 fly_api_token = "fo1_..."
 
-# Attestation
+# Strict mode attestation allowlist
 allowed_digests = [
     "sha256:abc123...",
     "sha256:def456...",
@@ -657,6 +657,7 @@ client generates a cryptographically random 512-bit key and writes it.
 ```
 fly-vault connect <vault-name>                # connect with defaults from config
 fly-vault connect <vault-name> --forward 3000:localhost:3000
+fly-vault connect <vault-name> --strict       # enable digest + machine config verification
 fly-vault connect <vault-name> --reprovision  # replace rootfs on locked vault (§6.4)
 fly-vault keygen <vault-name>                 # generate a new key (first-time setup)
 fly-vault build                               # build the init image, print digest
@@ -672,9 +673,9 @@ fly-vault allow <vault-name> <digest>         # add a digest to the allowlist
  4.  Send RequestAttestation
  5.  Receive Attestation { state, jwt }
  6.  Verify JWT (§4.3):
-       - signature, exp/nbf, aud == local TLS exporter
-       - image_digest in allowlist
- 7.  Verify machine config (§4.4):
+       - always: signature, iss == org issuer, aud == local TLS exporter, app_name == configured app, exp/nbf checks
+       - strict only: image_digest allowlist
+ 7.  Strict mode only: verify machine config (§4.4):
        - extract app_name, machine_id, machine_version from JWT
        - GET https://api.machines.dev/v1/apps/{app_name}/machines/{machine_id}
        - check response.instance_id == machine_version

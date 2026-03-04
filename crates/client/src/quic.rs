@@ -27,6 +27,7 @@ pub async fn connect_and_run(
     key: XtsKey,
     forwards: Vec<String>,
     reprovision: bool,
+    strict: bool,
 ) -> Result<()> {
     let mut endpoint = build_client_endpoint(cfg.machine_id.clone())?;
     endpoint.set_default_client_config(insecure_client_config()?);
@@ -63,57 +64,53 @@ pub async fn connect_and_run(
         .build()
         .context("build reqwest client")?;
 
-    let claims = attest::verify_attestation_jwt(
-        &http_client,
-        &attestation.jwt,
-        &cfg.org,
-        &aud,
-        &cfg.allowed_digests,
-    )
-    .await?;
-    info!(
-        issuer = %claims.iss,
-        audience = %claims.aud,
-        digest = %claims.image_digest,
-        app = %claims.app_name,
-        machine = %claims.machine_id,
-        version = %claims.machine_version,
-        exp = claims.exp,
-        nbf = ?claims.nbf,
-        "attestation verified"
-    );
+    if strict {
+        let claims = attest::verify_attestation_jwt_strict(
+            &http_client,
+            &attestation.jwt,
+            &cfg.org,
+            &aud,
+            &cfg.allowed_digests,
+        )
+        .await?;
+        assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
+        info!(
+            issuer = %claims.iss,
+            audience = %claims.aud,
+            digest = %claims.image_digest,
+            app = %claims.app_name,
+            machine = %claims.machine_id,
+            version = %claims.machine_version,
+            exp = claims.exp,
+            nbf = ?claims.nbf,
+            "attestation verified (strict)"
+        );
 
-    let expected_issuer = format!("https://oidc.fly.io/{}", cfg.org);
-    if claims.iss != expected_issuer {
-        return Err(anyhow!(
-            "attestation org mismatch: issuer={} expected={}",
-            claims.iss,
-            expected_issuer
-        ));
+        let api_token = cfg
+            .fly_api_token
+            .clone()
+            .or_else(|| std::env::var("FLY_API_TOKEN").ok())
+            .ok_or_else(|| anyhow!("missing fly api token in config or FLY_API_TOKEN"))?;
+
+        config_verify::verify_machine_config(
+            &http_client,
+            &api_token,
+            &claims.app_name,
+            &claims.machine_id,
+            &claims.machine_version,
+        )
+        .await?;
+    } else {
+        let claims =
+            attest::verify_attestation_jwt_relaxed(&http_client, &attestation.jwt, &cfg.org, &aud)
+                .await?;
+        assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
+        info!(
+            issuer = %claims.iss,
+            app = %claims.app_name,
+            "attestation verified (relaxed: aud+org+app)"
+        );
     }
-
-    if claims.app_name != cfg.app {
-        return Err(anyhow!(
-            "attestation app mismatch: app_name={} expected={}",
-            claims.app_name,
-            cfg.app
-        ));
-    }
-
-    let api_token = cfg
-        .fly_api_token
-        .clone()
-        .or_else(|| std::env::var("FLY_API_TOKEN").ok())
-        .ok_or_else(|| anyhow!("missing fly api token in config or FLY_API_TOKEN"))?;
-
-    config_verify::verify_machine_config(
-        &http_client,
-        &api_token,
-        &claims.app_name,
-        &claims.machine_id,
-        &claims.machine_version,
-    )
-    .await?;
 
     tracing::info!(state = ?attestation.state, "vm state");
 
@@ -294,6 +291,27 @@ fn expand_tilde(path: &str) -> Result<PathBuf> {
         return Ok(home.join(rest));
     }
     Ok(PathBuf::from(path))
+}
+
+fn assert_org_and_app(issuer: &str, app_name: &str, cfg: &VaultConfig) -> Result<()> {
+    let expected_issuer = format!("https://oidc.fly.io/{}", cfg.org);
+    if issuer != expected_issuer {
+        return Err(anyhow!(
+            "attestation org mismatch: issuer={} expected={}",
+            issuer,
+            expected_issuer
+        ));
+    }
+
+    if app_name != cfg.app {
+        return Err(anyhow!(
+            "attestation app mismatch: app_name={} expected={}",
+            app_name,
+            cfg.app
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]

@@ -208,7 +208,10 @@ fn snapshot_from_machine(machine: Machine) -> Result<MachineSnapshot> {
         .cloned()
         .ok_or_else(|| anyhow!("machine {} missing {} metadata", machine.id, TENANT_ID_KEY))?;
 
-    let managed_by = metadata.get(MANAGED_BY_KEY).map(String::as_str).unwrap_or("");
+    let managed_by = metadata
+        .get(MANAGED_BY_KEY)
+        .map(String::as_str)
+        .unwrap_or("");
     if managed_by != MANAGED_BY_VALUE {
         return Err(anyhow!(
             "machine {} not managed by fly-vault-admin",
@@ -321,7 +324,9 @@ async fn update_one_machine(
     .await;
 
     if operation_result.is_err() {
-        let _ = client.uncordon_machine(&snapshot.machine_id, Some(&lease.nonce)).await;
+        let _ = client
+            .uncordon_machine(&snapshot.machine_id, Some(&lease.nonce))
+            .await;
     }
 
     let release_result = client
@@ -390,10 +395,8 @@ async fn rollback_one_machine(
             .await
             .with_context(|| format!("cordon machine {}", snapshot.machine_id))?;
 
-        let config =
-            with_image(&current.config, &snapshot.previous_image).with_context(|| {
-                format!("set rollback image for machine {}", snapshot.machine_id)
-            })?;
+        let config = with_image(&current.config, &snapshot.previous_image)
+            .with_context(|| format!("set rollback image for machine {}", snapshot.machine_id))?;
         let config = with_metadata(&config, current.metadata())
             .with_context(|| format!("set metadata for machine {}", snapshot.machine_id))?;
         let request = UpdateMachineRequest {
@@ -431,7 +434,9 @@ async fn rollback_one_machine(
     .await;
 
     if operation_result.is_err() {
-        let _ = client.uncordon_machine(&snapshot.machine_id, Some(&lease.nonce)).await;
+        let _ = client
+            .uncordon_machine(&snapshot.machine_id, Some(&lease.nonce))
+            .await;
     }
 
     let release_result = client

@@ -122,10 +122,7 @@ fn maybe_start_machine(
             map.get(&machine_id).map(|info| info.state.clone())
         };
 
-        let should_start = matches!(
-            state.as_deref(),
-            Some("stopped" | "suspended" | "created")
-        );
+        let should_start = matches!(state.as_deref(), Some("stopped" | "suspended" | "created"));
         if !should_start {
             return;
         }

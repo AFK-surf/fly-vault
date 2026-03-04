@@ -15,8 +15,14 @@ pub struct AttestationClaims {
     pub nbf: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RelaxedAttestationClaims {
+    pub iss: String,
+    pub app_name: String,
+}
+
 #[derive(Debug, Deserialize)]
-struct RawClaims {
+struct RawStrictClaims {
     iss: String,
     aud: String,
     image_digest: String,
@@ -32,7 +38,7 @@ struct OidcDiscovery {
     jwks_uri: String,
 }
 
-pub async fn verify_attestation_jwt(
+pub async fn verify_attestation_jwt_strict(
     client: &Client,
     jwt: &str,
     org: &str,
@@ -41,6 +47,75 @@ pub async fn verify_attestation_jwt(
 ) -> Result<AttestationClaims> {
     let jwt = jwt.trim_end_matches('\n');
     tracing::debug!(jwt, "verifying attestation jwt");
+    let (issuer, decoding_key) = fetch_decoding_key(client, jwt, org).await?;
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[issuer.as_str()]);
+    validation.set_audience(&[expected_aud]);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.required_spec_claims = ["exp", "iss", "aud"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let data = decode::<RawStrictClaims>(jwt, &decoding_key, &validation).context("verify jwt")?;
+
+    if !allowed_digests
+        .iter()
+        .any(|d| d == &data.claims.image_digest)
+    {
+        return Err(anyhow!(
+            "image digest {} is not in allowlist",
+            data.claims.image_digest
+        ));
+    }
+
+    Ok(AttestationClaims {
+        iss: data.claims.iss,
+        aud: data.claims.aud,
+        image_digest: data.claims.image_digest,
+        app_name: data.claims.app_name,
+        machine_id: data.claims.machine_id,
+        machine_version: data.claims.machine_version,
+        exp: data.claims.exp,
+        nbf: data.claims.nbf,
+    })
+}
+
+pub async fn verify_attestation_jwt_relaxed(
+    client: &Client,
+    jwt: &str,
+    org: &str,
+    expected_aud: &str,
+) -> Result<RelaxedAttestationClaims> {
+    let jwt = jwt.trim_end_matches('\n');
+    tracing::debug!(jwt, "verifying attestation jwt in relaxed mode");
+    let (issuer, decoding_key) = fetch_decoding_key(client, jwt, org).await?;
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[issuer.as_str()]);
+    validation.set_audience(&[expected_aud]);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.required_spec_claims = ["exp", "iss", "aud"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let data = decode::<RawRelaxedClaims>(jwt, &decoding_key, &validation).context("verify jwt")?;
+
+    Ok(RelaxedAttestationClaims {
+        iss: data.claims.iss,
+        app_name: data.claims.app_name,
+    })
+}
+
+async fn fetch_decoding_key(
+    client: &Client,
+    jwt: &str,
+    org: &str,
+) -> Result<(String, DecodingKey)> {
     let issuer = format!("https://oidc.fly.io/{org}");
     let discovery_url = format!("{issuer}/.well-known/openid-configuration");
 
@@ -76,35 +151,11 @@ pub async fn verify_attestation_jwt(
         .ok_or_else(|| anyhow!("jwk with kid {kid} not found"))?;
     let decoding_key = DecodingKey::from_jwk(jwk).context("build decoding key from jwk")?;
 
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.set_issuer(&[issuer.as_str()]);
-    validation.set_audience(&[expected_aud]);
-    validation.validate_nbf = true;
-    validation.required_spec_claims = ["exp", "iss", "aud"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    Ok((issuer, decoding_key))
+}
 
-    let data = decode::<RawClaims>(jwt, &decoding_key, &validation).context("verify jwt")?;
-
-    if !allowed_digests
-        .iter()
-        .any(|d| d == &data.claims.image_digest)
-    {
-        return Err(anyhow!(
-            "image digest {} is not in allowlist",
-            data.claims.image_digest
-        ));
-    }
-
-    Ok(AttestationClaims {
-        iss: data.claims.iss,
-        aud: data.claims.aud,
-        image_digest: data.claims.image_digest,
-        app_name: data.claims.app_name,
-        machine_id: data.claims.machine_id,
-        machine_version: data.claims.machine_version,
-        exp: data.claims.exp,
-        nbf: data.claims.nbf,
-    })
+#[derive(Debug, Deserialize)]
+struct RawRelaxedClaims {
+    iss: String,
+    app_name: String,
 }

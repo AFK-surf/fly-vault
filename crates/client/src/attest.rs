@@ -19,6 +19,7 @@ pub struct AttestationClaims {
 pub struct RelaxedAttestationClaims {
     pub iss: String,
     pub app_name: String,
+    pub machine_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +109,7 @@ pub async fn verify_attestation_jwt_relaxed(
     Ok(RelaxedAttestationClaims {
         iss: data.claims.iss,
         app_name: data.claims.app_name,
+        machine_id: data.claims.machine_id,
     })
 }
 
@@ -158,4 +160,5 @@ async fn fetch_decoding_key(
 struct RawRelaxedClaims {
     iss: String,
     app_name: String,
+    machine_id: String,
 }

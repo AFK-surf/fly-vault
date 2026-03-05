@@ -74,6 +74,7 @@ pub async fn connect_and_run(
         )
         .await?;
         assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
+        assert_machine_id(&claims.machine_id, &cfg)?;
         info!(
             issuer = %claims.iss,
             audience = %claims.aud,
@@ -105,9 +106,11 @@ pub async fn connect_and_run(
             attest::verify_attestation_jwt_relaxed(&http_client, &attestation.jwt, &cfg.org, &aud)
                 .await?;
         assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
+        assert_machine_id(&claims.machine_id, &cfg)?;
         info!(
             issuer = %claims.iss,
             app = %claims.app_name,
+            machine = %claims.machine_id,
             "attestation verified (relaxed: aud+org+app)"
         );
     }
@@ -314,6 +317,20 @@ fn assert_org_and_app(issuer: &str, app_name: &str, cfg: &VaultConfig) -> Result
     Ok(())
 }
 
+fn assert_machine_id(attested_machine_id: &str, cfg: &VaultConfig) -> Result<()> {
+    if let Some(expected_machine_id) = cfg.machine_id.as_deref() {
+        if attested_machine_id != expected_machine_id {
+            return Err(anyhow!(
+                "attestation machine mismatch: machine_id={} expected={}",
+                attested_machine_id,
+                expected_machine_id
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct NoVerifier;
 
@@ -353,5 +370,47 @@ impl ServerCertVerifier for NoVerifier {
             SignatureScheme::ECDSA_NISTP256_SHA256,
             SignatureScheme::ED25519,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assert_machine_id;
+    use crate::VaultConfig;
+
+    fn make_cfg(machine_id: Option<&str>) -> VaultConfig {
+        VaultConfig {
+            address: "127.0.0.1:443".to_string(),
+            org: "test-org".to_string(),
+            app: "test-app".to_string(),
+            machine_id: machine_id.map(str::to_string),
+            fly_api_token: None,
+            allowed_digests: vec![],
+            forward: vec![],
+            rootfs: None,
+            rootfs_url: None,
+            provision_token: None,
+        }
+    }
+
+    #[test]
+    fn machine_id_check_skips_when_not_configured() {
+        let cfg = make_cfg(None);
+        assert_machine_id("machine-any", &cfg).expect("machine id should not be enforced");
+    }
+
+    #[test]
+    fn machine_id_check_accepts_match() {
+        let cfg = make_cfg(Some("machine-123"));
+        assert_machine_id("machine-123", &cfg).expect("matching machine id should pass");
+    }
+
+    #[test]
+    fn machine_id_check_rejects_mismatch() {
+        let cfg = make_cfg(Some("machine-123"));
+        let err = assert_machine_id("machine-999", &cfg).expect_err("mismatched machine id");
+        assert!(err
+            .to_string()
+            .contains("attestation machine mismatch: machine_id=machine-999 expected=machine-123"));
     }
 }

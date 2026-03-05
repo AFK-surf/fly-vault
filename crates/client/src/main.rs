@@ -70,6 +70,10 @@ struct VaultConfig {
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

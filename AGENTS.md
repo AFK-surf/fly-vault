@@ -6,7 +6,6 @@ This repository is a Rust workspace for a secure Fly.io vault system.
 - `crates/client/`: `fly-vault` CLI (attestation verification, config verification, console, port forwarding).
 - `crates/init/`: VM-side `init` binary (QUIC server, state machine, setup flow, forwarding).
 - `crates/protocol/`: shared wire protocol (stream tags, framed control/console messages).
-- `crates/crypto/`: AES-256-XTS sector crypto and key types.
 - `docs/`: reference docs for OIDC, Machines API, FUSE, loop devices, namespaces, TLS exporter.
 - Root files: `DESIGN.md` (source-of-truth design), `README.md` (usage), `Dockerfile`, `fly.toml`.
 

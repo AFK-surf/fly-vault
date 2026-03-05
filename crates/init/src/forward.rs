@@ -86,7 +86,7 @@ pub async fn handle_console_stream(
             "-a",
             "-t",
             &pid.as_raw().to_string(),
-            "--wd=/mnt/root",
+            &format!("--wd={}", root_dir.display()),
             shell,
             "-l",
         ]);

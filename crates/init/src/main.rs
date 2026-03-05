@@ -1,6 +1,5 @@
 mod attest;
 mod forward;
-mod fuse;
 mod quic;
 mod setup;
 
@@ -25,10 +24,7 @@ struct Args {
     #[arg(long, default_value = "/data")]
     data_dir: PathBuf,
 
-    #[arg(long, default_value = "/tmp/fuse")]
-    fuse_mount_dir: PathBuf,
-
-    #[arg(long, default_value = "/mnt/root")]
+    #[arg(long, default_value = "/data/rootfs")]
     root_mount_dir: PathBuf,
 
     #[arg(long, default_value = "/sbin/init")]
@@ -45,8 +41,7 @@ struct Args {
 pub struct SharedState {
     pub vm_state: VmState,
     pub setup: setup::SetupManager,
-    pub provision_token: Option<String>,
-    pub key_hash: Option<[u8; 32]>,
+    pub access_token: Option<String>,
 }
 
 #[tokio::main]
@@ -63,30 +58,33 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let setup = setup::SetupManager::new(
+    let mut setup = setup::SetupManager::new(
         args.data_dir.clone(),
-        args.fuse_mount_dir.clone(),
         args.root_mount_dir.clone(),
         args.init_binary.clone(),
         args.test_mode,
     )?;
 
-    let provision_token = std::env::var("PROVISION_TOKEN").ok();
-    std::env::remove_var("PROVISION_TOKEN");
-    if provision_token.is_some() {
-        info!("PROVISION_TOKEN set");
+    let access_token = std::env::var("ACCESS_TOKEN").ok();
+    std::env::remove_var("ACCESS_TOKEN");
+    if access_token.is_some() {
+        info!("ACCESS_TOKEN set");
     } else {
-        warn!("PROVISION_TOKEN not set; cold boot provisioning will be rejected");
+        warn!("ACCESS_TOKEN not set; provisioning/reconnect will be rejected");
     }
 
     let initial_state = setup.detect_state()?;
     info!(state = ?initial_state, "boot state detected");
+    if initial_state == VmState::Ready {
+        setup
+            .start_ready_runtime()
+            .context("start namespaced init for ready state")?;
+    }
 
     let shared = Arc::new(Mutex::new(SharedState {
         vm_state: initial_state,
         setup,
-        provision_token,
-        key_hash: None,
+        access_token,
     }));
 
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;

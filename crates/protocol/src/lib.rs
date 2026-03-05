@@ -9,11 +9,10 @@ pub const STREAM_CONSOLE: u8 = 0x03;
 
 pub const CONTROL_REQUEST_ATTESTATION: u8 = 0x01;
 pub const CONTROL_ATTESTATION: u8 = 0x02;
-pub const CONTROL_RELEASE_KEY: u8 = 0x03;
 pub const CONTROL_PROVISION_ROOTFS: u8 = 0x04;
 pub const CONTROL_SETUP_COMPLETE: u8 = 0x05;
 pub const CONTROL_ERROR: u8 = 0x06;
-pub const CONTROL_PROVISION_TOKEN: u8 = 0x07;
+pub const CONTROL_ACCESS_TOKEN: u8 = 0x07;
 pub const CONTROL_PROVISION_ROOTFS_URL: u8 = 0x08;
 
 pub const CONSOLE_DATA: u8 = 0x00;
@@ -24,16 +23,14 @@ pub const CONSOLE_EXIT: u8 = 0x02;
 #[repr(u8)]
 pub enum VmState {
     Cold = 0x00,
-    Locked = 0x01,
-    Ready = 0x02,
+    Ready = 0x01,
 }
 
 impl VmState {
     pub fn from_u8(value: u8) -> Result<Self> {
         match value {
             0x00 => Ok(Self::Cold),
-            0x01 => Ok(Self::Locked),
-            0x02 => Ok(Self::Ready),
+            0x01 | 0x02 => Ok(Self::Ready),
             _ => Err(anyhow!("invalid vm state: {value}")),
         }
     }

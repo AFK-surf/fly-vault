@@ -1,5 +1,4 @@
 mod attest;
-mod config_verify;
 mod console;
 mod forward;
 mod proxy_udp;
@@ -7,12 +6,10 @@ mod quic;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use crypto::{XtsKey, XTS_KEY_SIZE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use tracing::info;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "fly-vault")]
@@ -27,19 +24,9 @@ enum Command {
         vault: String,
         #[arg(long = "forward")]
         forward: Vec<String>,
-        /// Enforce full attestation checks (audience/digest + machine config via Fly API)
-        #[arg(long)]
-        strict: bool,
-        /// Re-provision the vault with a new rootfs while in locked state
+        /// Re-provision the vault with a new rootfs while in ready state.
         #[arg(long)]
         reprovision: bool,
-    },
-    Keygen {
-        vault: String,
-    },
-    Allow {
-        vault: String,
-        digest: String,
     },
     Build,
 }
@@ -56,14 +43,11 @@ struct VaultConfig {
     org: String,
     app: String,
     machine_id: Option<String>,
-    fly_api_token: Option<String>,
-    #[serde(default)]
-    allowed_digests: Vec<String>,
     #[serde(default)]
     forward: Vec<String>,
     rootfs: Option<String>,
     rootfs_url: Option<String>,
-    provision_token: Option<String>,
+    access_token: Option<String>,
 }
 
 #[tokio::main]
@@ -83,7 +67,6 @@ async fn main() -> Result<()> {
         Command::Connect {
             vault,
             forward,
-            strict,
             reprovision,
         } => {
             let (config_path, mut cfg_file) = load_config_file()?;
@@ -92,36 +75,13 @@ async fn main() -> Result<()> {
                 .remove(&vault)
                 .ok_or_else(|| anyhow!("vault {vault} not found in {}", config_path.display()))?;
 
-            let key = load_or_create_key(&vault)?;
             let forwards = if forward.is_empty() {
                 vault_cfg.forward.clone()
             } else {
                 forward
             };
 
-            quic::connect_and_run(vault, vault_cfg, key, forwards, reprovision, strict).await?;
-        }
-        Command::Keygen { vault } => {
-            let path = key_path(&vault)?;
-            if path.exists() {
-                return Err(anyhow!("key already exists at {}", path.display()));
-            }
-            let _ = generate_key_file(&path)?;
-            info!(path = %path.display(), "key generated");
-        }
-        Command::Allow { vault, digest } => {
-            let (config_path, mut cfg) = load_config_file()?;
-            let vault_cfg = cfg
-                .vault
-                .get_mut(&vault)
-                .ok_or_else(|| anyhow!("vault {vault} not found in {}", config_path.display()))?;
-            if !vault_cfg.allowed_digests.contains(&digest) {
-                vault_cfg.allowed_digests.push(digest);
-            }
-            let doc = toml::to_string_pretty(&cfg).context("serialize config toml")?;
-            fs::write(&config_path, doc)
-                .with_context(|| format!("write {}", config_path.display()))?;
-            info!(path = %config_path.display(), "allowlist updated");
+            quic::connect_and_run(vault, vault_cfg, forwards, reprovision).await?;
         }
         Command::Build => {
             run_build_commands()?;
@@ -163,67 +123,6 @@ fn load_config_file() -> Result<(PathBuf, ConfigFile)> {
 fn config_path() -> Result<PathBuf> {
     let base = dirs::config_dir().ok_or_else(|| anyhow!("unable to determine config directory"))?;
     Ok(base.join("fly-vault").join("config.toml"))
-}
-
-fn keys_dir() -> Result<PathBuf> {
-    let base = dirs::config_dir().ok_or_else(|| anyhow!("unable to determine config directory"))?;
-    Ok(base.join("fly-vault").join("keys"))
-}
-
-fn key_path(vault: &str) -> Result<PathBuf> {
-    Ok(keys_dir()?.join(format!("{vault}.key")))
-}
-
-fn load_or_create_key(vault: &str) -> Result<XtsKey> {
-    let path = key_path(vault)?;
-    if path.exists() {
-        return load_key_file(&path);
-    }
-
-    let key = generate_key_file(&path)?;
-    Ok(key)
-}
-
-fn load_key_file(path: &Path) -> Result<XtsKey> {
-    let bytes = fs::read(path).with_context(|| format!("read key {}", path.display()))?;
-    if bytes.len() != XTS_KEY_SIZE {
-        return Err(anyhow!(
-            "invalid key size in {}: got {}, expected {}",
-            path.display(),
-            bytes.len(),
-            XTS_KEY_SIZE
-        ));
-    }
-    XtsKey::from_slice(&bytes)
-}
-
-fn generate_key_file(path: &Path) -> Result<XtsKey> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create key dir {}", parent.display()))?;
-    }
-
-    let mut bytes = [0u8; XTS_KEY_SIZE];
-    use rand::RngCore;
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-
-    fs::write(path, bytes).with_context(|| format!("write key {}", path.display()))?;
-    set_0600(path)?;
-
-    XtsKey::from_slice(&bytes)
-}
-
-#[cfg(unix)]
-fn set_0600(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, perms).with_context(|| format!("set 0600 on {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_0600(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

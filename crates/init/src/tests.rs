@@ -1,15 +1,14 @@
 use super::*;
 use anyhow::{anyhow, Context, Result};
 use protocol::{
-    AttestationPayload, ControlFrame, VmState, CONTROL_ATTESTATION, CONTROL_ERROR,
-    CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL, CONTROL_PROVISION_TOKEN,
-    CONTROL_RELEASE_KEY, CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONTROL,
+    AttestationPayload, ControlFrame, VmState, CONTROL_ACCESS_TOKEN, CONTROL_ATTESTATION,
+    CONTROL_ERROR, CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL,
+    CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONTROL,
 };
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-use sha2::{Digest, Sha256};
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,52 +16,124 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 
+#[test]
+fn startup_in_ready_state_starts_runtime() -> Result<()> {
+    let temp = TempDir::new().context("create temp dir")?;
+    let data_dir = temp.path().join("data");
+    let root_dir = temp.path().join("root");
+    std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+    std::fs::create_dir_all(&root_dir).with_context(|| format!("create {}", root_dir.display()))?;
+    std::fs::write(data_dir.join(".access_token_hash"), [0u8; 32]).context("write token hash")?;
+
+    let mut setup = setup::SetupManager::new(
+        data_dir,
+        root_dir,
+        "/sbin/init".into(),
+        true, // test_mode
+    )?;
+    assert_eq!(setup.detect_state()?, VmState::Ready);
+    assert!(!setup.runtime_started());
+
+    setup.start_ready_runtime()?;
+    assert!(setup.runtime_started());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_provisioning_resets_existing_rootfs() -> Result<()> {
+    let temp = TempDir::new().context("create temp dir")?;
+    let data_dir = temp.path().join("data");
+    let root_dir = temp.path().join("root");
+    std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+    std::fs::create_dir_all(&root_dir).with_context(|| format!("create {}", root_dir.display()))?;
+    let stale = root_dir.join("stale.txt");
+    std::fs::write(&stale, "old").context("write stale file")?;
+
+    let mut setup = setup::SetupManager::new(
+        data_dir.clone(),
+        root_dir.clone(),
+        "/sbin/init".into(),
+        true, // test_mode
+    )?;
+
+    setup
+        .setup_and_prepare("token-a", Some(vec![1, 2, 3]))
+        .await
+        .context("cold provision")?;
+
+    assert!(
+        !stale.exists(),
+        "rootfs dir should be reset before provisioning"
+    );
+    assert!(data_dir.join(".access_token_hash").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn reprovisioning_kills_runtime_and_resets_rootfs() -> Result<()> {
+    let temp = TempDir::new().context("create temp dir")?;
+    let data_dir = temp.path().join("data");
+    let root_dir = temp.path().join("root");
+    std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+    std::fs::create_dir_all(&root_dir).with_context(|| format!("create {}", root_dir.display()))?;
+
+    let mut setup = setup::SetupManager::new(
+        data_dir.clone(),
+        root_dir.clone(),
+        "/sbin/init".into(),
+        true, // test_mode
+    )?;
+    setup
+        .setup_and_prepare("token-a", Some(vec![1, 2, 3]))
+        .await
+        .context("initial provision")?;
+    assert!(setup.runtime_started());
+
+    let stale = root_dir.join("stale.txt");
+    std::fs::write(&stale, "old").context("write stale file")?;
+
+    setup
+        .setup_and_prepare("token-a", Some(vec![4, 5, 6]))
+        .await
+        .context("reprovision")?;
+
+    assert!(
+        !stale.exists(),
+        "rootfs dir should be reset before reprovisioning"
+    );
+    assert!(setup.runtime_started(), "runtime should be started again");
+    assert!(data_dir.join(".access_token_hash").exists());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_boot_to_ready_and_reconnect() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
     let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, false)?;
-    let shared = shared_state_for_args(&args, Some("test-provision-token".to_string())).await?;
+    let args = args_for_test(&temp, port)?;
+    let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
     let endpoint = test_endpoint()?;
     let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
     let conn = connect_with_retry(&endpoint, addr).await?;
-    let (mut send, mut recv) = open_control_stream(&conn).await?;
 
-    let att = request_attestation(&mut send, &mut recv).await?;
-    assert_eq!(att.state, VmState::Cold);
+    provision_cold(
+        &conn,
+        "test-access-token",
+        ControlRootfs::Inline(b"fake-rootfs".to_vec()),
+    )
+    .await?;
 
-    ControlFrame::new(CONTROL_PROVISION_TOKEN, b"test-provision-token".to_vec())
-        .write_to(&mut send)
-        .await
-        .context("send provision token")?;
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![7u8; 64])
-        .write_to(&mut send)
-        .await
-        .context("send key")?;
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs".to_vec())
-        .write_to(&mut send)
-        .await
-        .context("send rootfs")?;
-    wait_setup_complete(&mut recv).await?;
-
-    // Control stream returned after setup. Open a new one to check state.
     let (mut send2, mut recv2) = open_control_stream(&conn).await?;
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
 
-    // Reconnect on a fresh connection requires key verification.
-    let conn2 = connect_with_retry(&endpoint, addr).await?;
-    let (mut send3, mut recv3) = open_control_stream(&conn2).await?;
-    let att3 = request_attestation(&mut send3, &mut recv3).await?;
-    assert_eq!(att3.state, VmState::Ready);
-
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![7u8; 64])
-        .write_to(&mut send3)
+    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"test-access-token".to_vec())
+        .write_to(&mut send2)
         .await
-        .context("send key on reconnect")?;
-    wait_setup_complete(&mut recv3).await?;
+        .context("send access token")?;
+    wait_setup_complete(&mut recv2).await?;
 
     server.abort();
     Ok(())
@@ -72,8 +143,8 @@ async fn cold_boot_to_ready_and_reconnect() -> Result<()> {
 async fn cold_boot_with_rootfs_url() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
     let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, false)?;
-    let shared = shared_state_for_args(&args, Some("test-provision-token".to_string())).await?;
+    let args = args_for_test(&temp, port)?;
+    let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
     let (rootfs_url, rootfs_server) = spawn_rootfs_http_server(b"fake-rootfs".to_vec()).await?;
@@ -81,26 +152,9 @@ async fn cold_boot_with_rootfs_url() -> Result<()> {
     let endpoint = test_endpoint()?;
     let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
     let conn = connect_with_retry(&endpoint, addr).await?;
-    let (mut send, mut recv) = open_control_stream(&conn).await?;
 
-    let att = request_attestation(&mut send, &mut recv).await?;
-    assert_eq!(att.state, VmState::Cold);
+    provision_cold(&conn, "test-access-token", ControlRootfs::Url(rootfs_url)).await?;
 
-    ControlFrame::new(CONTROL_PROVISION_TOKEN, b"test-provision-token".to_vec())
-        .write_to(&mut send)
-        .await
-        .context("send provision token")?;
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![7u8; 64])
-        .write_to(&mut send)
-        .await
-        .context("send key")?;
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS_URL, rootfs_url.into_bytes())
-        .write_to(&mut send)
-        .await
-        .context("send rootfs url")?;
-    wait_setup_complete(&mut recv).await?;
-
-    // Control stream returned after setup. Open a new one to check state.
     let (mut send2, mut recv2) = open_control_stream(&conn).await?;
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
@@ -111,41 +165,10 @@ async fn cold_boot_with_rootfs_url() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn locked_boot_to_ready() -> Result<()> {
+async fn cold_boot_rejected_without_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
     let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, true)?;
-    let shared = shared_state_for_args(&args, None).await?;
-    let server = tokio::spawn(quic::serve(args.clone(), shared));
-
-    let endpoint = test_endpoint()?;
-    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
-    let conn = connect_with_retry(&endpoint, addr).await?;
-    let (mut send, mut recv) = open_control_stream(&conn).await?;
-
-    let att = request_attestation(&mut send, &mut recv).await?;
-    assert_eq!(att.state, VmState::Locked);
-
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![9u8; 64])
-        .write_to(&mut send)
-        .await
-        .context("send key")?;
-    wait_setup_complete(&mut recv).await?;
-
-    // Control stream returned after setup. Open a new one to check state.
-    let (mut send2, mut recv2) = open_control_stream(&conn).await?;
-    let att2 = request_attestation(&mut send2, &mut recv2).await?;
-    assert_eq!(att2.state, VmState::Ready);
-
-    server.abort();
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_boot_rejected_without_provision_token() -> Result<()> {
-    let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, false)?;
+    let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("correct-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
@@ -157,11 +180,6 @@ async fn cold_boot_rejected_without_provision_token() -> Result<()> {
     let att = request_attestation(&mut send, &mut recv).await?;
     assert_eq!(att.state, VmState::Cold);
 
-    // Send key and rootfs without provision token — should be rejected.
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![7u8; 64])
-        .write_to(&mut send)
-        .await
-        .context("send key")?;
     ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs".to_vec())
         .write_to(&mut send)
         .await
@@ -173,8 +191,8 @@ async fn cold_boot_rejected_without_provision_token() -> Result<()> {
     assert_eq!(frame.ty, CONTROL_ERROR);
     let msg = String::from_utf8(frame.payload).unwrap();
     assert!(
-        msg.contains("provision token"),
-        "expected provision token error, got: {msg}"
+        msg.contains("access token"),
+        "expected access token error, got: {msg}"
     );
 
     server.abort();
@@ -182,10 +200,10 @@ async fn cold_boot_rejected_without_provision_token() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_boot_rejected_with_wrong_provision_token() -> Result<()> {
+async fn cold_boot_rejected_with_wrong_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
     let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, false)?;
+    let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("correct-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
@@ -197,11 +215,10 @@ async fn cold_boot_rejected_with_wrong_provision_token() -> Result<()> {
     let att = request_attestation(&mut send, &mut recv).await?;
     assert_eq!(att.state, VmState::Cold);
 
-    // Send wrong provision token.
-    ControlFrame::new(CONTROL_PROVISION_TOKEN, b"wrong-token".to_vec())
+    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"wrong-token".to_vec())
         .write_to(&mut send)
         .await
-        .context("send wrong provision token")?;
+        .context("send wrong access token")?;
 
     let frame = ControlFrame::read_from(&mut recv)
         .await
@@ -218,50 +235,40 @@ async fn cold_boot_rejected_with_wrong_provision_token() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ready_rejects_wrong_key() -> Result<()> {
+async fn ready_rejects_wrong_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
     let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, false)?;
-    let shared = shared_state_for_args(&args, Some("test-provision-token".to_string())).await?;
+    let args = args_for_test(&temp, port)?;
+    let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
     let endpoint = test_endpoint()?;
     let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
-
-    // First connection: provision with the correct key.
     let conn = connect_with_retry(&endpoint, addr).await?;
-    let (mut send, mut recv) = open_control_stream(&conn).await?;
-    let att = request_attestation(&mut send, &mut recv).await?;
-    assert_eq!(att.state, VmState::Cold);
 
-    ControlFrame::new(CONTROL_PROVISION_TOKEN, b"test-provision-token".to_vec())
-        .write_to(&mut send)
-        .await?;
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![7u8; 64])
-        .write_to(&mut send)
-        .await?;
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs".to_vec())
-        .write_to(&mut send)
-        .await?;
-    wait_setup_complete(&mut recv).await?;
+    provision_cold(
+        &conn,
+        "test-access-token",
+        ControlRootfs::Inline(b"fake-rootfs".to_vec()),
+    )
+    .await?;
 
-    // Second connection: try reconnecting with a WRONG key.
-    let conn2 = connect_with_retry(&endpoint, addr).await?;
-    let (mut send2, mut recv2) = open_control_stream(&conn2).await?;
+    let (mut send2, mut recv2) = open_control_stream(&conn).await?;
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
 
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![99u8; 64])
+    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"wrong-token".to_vec())
         .write_to(&mut send2)
-        .await?;
+        .await
+        .context("send wrong access token")?;
     let frame = ControlFrame::read_from(&mut recv2)
         .await
         .context("read error frame")?;
     assert_eq!(frame.ty, CONTROL_ERROR);
     let msg = String::from_utf8(frame.payload).unwrap();
     assert!(
-        msg.contains("key verification failed"),
-        "expected key verification error, got: {msg}"
+        msg.contains("verification failed"),
+        "expected access token verification error, got: {msg}"
     );
 
     server.abort();
@@ -272,7 +279,7 @@ async fn ready_rejects_wrong_key() -> Result<()> {
 async fn unauthenticated_stream_rejected() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
     let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, false)?;
+    let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("tok".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
@@ -280,16 +287,14 @@ async fn unauthenticated_stream_rejected() -> Result<()> {
     let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
     let conn = connect_with_retry(&endpoint, addr).await?;
 
-    // Open a console stream without authenticating first.
     let (mut send, mut recv) = conn.open_bi().await.context("open bi")?;
     send.write_u8(protocol::STREAM_CONSOLE)
         .await
         .context("write console tag")?;
 
-    // The server should reset the stream. Reading should fail.
     let mut buf = [0u8; 64];
     match recv.read(&mut buf).await {
-        Ok(None) | Err(_) => {} // Expected: stream closed or reset.
+        Ok(None) | Err(_) => {}
         Ok(Some(_)) => panic!("expected stream to be rejected, but got data"),
     }
 
@@ -298,113 +303,85 @@ async fn unauthenticated_stream_rejected() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn locked_reprovision_with_token() -> Result<()> {
+async fn ready_reprovision_with_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
     let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, true)?;
-    let shared = shared_state_for_args(&args, Some("test-provision-token".to_string())).await?;
+    let args = args_for_test(&temp, port)?;
+    let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
     let endpoint = test_endpoint()?;
     let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
     let conn = connect_with_retry(&endpoint, addr).await?;
-    let (mut send, mut recv) = open_control_stream(&conn).await?;
 
-    let att = request_attestation(&mut send, &mut recv).await?;
-    assert_eq!(att.state, VmState::Locked);
+    provision_cold(
+        &conn,
+        "test-access-token",
+        ControlRootfs::Inline(b"fake-rootfs-v1".to_vec()),
+    )
+    .await?;
 
-    // Re-provision: send token, rootfs, then key (key last to trigger setup).
-    ControlFrame::new(CONTROL_PROVISION_TOKEN, b"test-provision-token".to_vec())
-        .write_to(&mut send)
-        .await
-        .context("send provision token")?;
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs".to_vec())
-        .write_to(&mut send)
-        .await
-        .context("send rootfs")?;
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![9u8; 64])
-        .write_to(&mut send)
-        .await
-        .context("send key")?;
-    wait_setup_complete(&mut recv).await?;
-
-    // Verify the server transitioned to Ready.
     let (mut send2, mut recv2) = open_control_stream(&conn).await?;
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
 
+    ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs-v2".to_vec())
+        .write_to(&mut send2)
+        .await
+        .context("send reprovision rootfs")?;
+    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"test-access-token".to_vec())
+        .write_to(&mut send2)
+        .await
+        .context("send access token")?;
+    wait_setup_complete(&mut recv2).await?;
+
     server.abort();
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn locked_reprovision_rejected_without_token() -> Result<()> {
-    let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
-    let args = args_for_test(&temp, port, true)?;
-    let shared = shared_state_for_args(&args, Some("test-provision-token".to_string())).await?;
-    let server = tokio::spawn(quic::serve(args.clone(), shared));
+enum ControlRootfs {
+    Inline(Vec<u8>),
+    Url(String),
+}
 
-    let endpoint = test_endpoint()?;
-    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
-    let conn = connect_with_retry(&endpoint, addr).await?;
-    let (mut send, mut recv) = open_control_stream(&conn).await?;
+async fn provision_cold(conn: &Connection, token: &str, rootfs: ControlRootfs) -> Result<()> {
+    let (mut send, mut recv) = open_control_stream(conn).await?;
 
     let att = request_attestation(&mut send, &mut recv).await?;
-    assert_eq!(att.state, VmState::Locked);
+    assert_eq!(att.state, VmState::Cold);
 
-    // Send rootfs and key without provision token — should be rejected.
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs".to_vec())
+    ControlFrame::new(CONTROL_ACCESS_TOKEN, token.as_bytes().to_vec())
         .write_to(&mut send)
         .await
-        .context("send rootfs")?;
-    ControlFrame::new(CONTROL_RELEASE_KEY, vec![9u8; 64])
-        .write_to(&mut send)
-        .await
-        .context("send key")?;
+        .context("send access token")?;
 
-    let frame = ControlFrame::read_from(&mut recv)
-        .await
-        .context("read error frame")?;
-    assert_eq!(frame.ty, CONTROL_ERROR);
-    let msg = String::from_utf8(frame.payload).unwrap();
-    assert!(
-        msg.contains("provision token"),
-        "expected provision token error, got: {msg}"
-    );
+    match rootfs {
+        ControlRootfs::Inline(data) => {
+            ControlFrame::new(CONTROL_PROVISION_ROOTFS, data)
+                .write_to(&mut send)
+                .await
+                .context("send rootfs")?;
+        }
+        ControlRootfs::Url(url) => {
+            ControlFrame::new(CONTROL_PROVISION_ROOTFS_URL, url.into_bytes())
+                .write_to(&mut send)
+                .await
+                .context("send rootfs url")?;
+        }
+    }
 
-    server.abort();
-    Ok(())
+    wait_setup_complete(&mut recv).await
 }
 
-fn args_for_test(temp: &TempDir, port: u16, locked: bool) -> Result<Args> {
+fn args_for_test(temp: &TempDir, port: u16) -> Result<Args> {
     let data_dir = temp.path().join("data");
-    let fuse_dir = temp.path().join("fuse");
     let root_dir = temp.path().join("root");
     std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
-    std::fs::create_dir_all(&fuse_dir).with_context(|| format!("create {}", fuse_dir.display()))?;
     std::fs::create_dir_all(&root_dir).with_context(|| format!("create {}", root_dir.display()))?;
-
-    if locked {
-        let encrypted = data_dir.join("encrypted.img");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&encrypted)
-            .with_context(|| format!("create {}", encrypted.display()))?;
-        file.set_len(4096)
-            .with_context(|| format!("set_len {}", encrypted.display()))?;
-        // Write SHA-256 of the key that locked_boot_to_ready will use ([9u8; 64]).
-        let key_hash: [u8; 32] = Sha256::digest([9u8; 64]).into();
-        std::fs::write(data_dir.join(".provisioned"), key_hash)
-            .context("write provisioned marker for test")?;
-    }
 
     Ok(Args {
         listen: SocketAddr::from((Ipv6Addr::LOCALHOST, port)).to_string(),
         data_dir,
-        fuse_mount_dir: fuse_dir,
         root_mount_dir: root_dir,
         init_binary: "/sbin/init".into(),
         channel_binding_label: "fly-vault-channel-binding".to_string(),
@@ -414,11 +391,10 @@ fn args_for_test(temp: &TempDir, port: u16, locked: bool) -> Result<Args> {
 
 async fn shared_state_for_args(
     args: &Args,
-    provision_token: Option<String>,
+    access_token: Option<String>,
 ) -> Result<Arc<Mutex<SharedState>>> {
     let setup = setup::SetupManager::new(
         args.data_dir.clone(),
-        args.fuse_mount_dir.clone(),
         args.root_mount_dir.clone(),
         args.init_binary.clone(),
         args.test_mode,
@@ -427,8 +403,7 @@ async fn shared_state_for_args(
     Ok(Arc::new(Mutex::new(SharedState {
         vm_state,
         setup,
-        provision_token,
-        key_hash: None,
+        access_token,
     })))
 }
 

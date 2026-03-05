@@ -2,7 +2,7 @@
 # Usage:
 #   fly-vault-admin tenant create acme \
 #     --template ./examples/tenant_template.toml \
-#     --provision-token "replace-me"
+#     --access-token "replace-me"
 
 version = 1
 app = "vault-tenants"
@@ -22,7 +22,7 @@ path = "/data"
 name = "tvol_{{tenant_id}}_{{index}}"
 
 [machine.config.env]
-PROVISION_TOKEN = "{{provision_token}}"
+ACCESS_TOKEN = "{{access_token}}"
 
 [metadata]
 role = "tenant-vm"

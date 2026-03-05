@@ -66,7 +66,7 @@ pub fn load_template(path: &Path) -> Result<TenantTemplate> {
 pub fn render_template(
     template: &TenantTemplate,
     tenant_id: &str,
-    provision_token: Option<&str>,
+    access_token: Option<&str>,
     extra_vars: &HashMap<String, String>,
 ) -> Result<Vec<RenderedMachineSpec>> {
     let mut rendered = Vec::with_capacity(template.machine_count);
@@ -76,8 +76,8 @@ pub fn render_template(
         vars.insert("tenant_id".to_string(), tenant_id.to_string());
         vars.insert("index".to_string(), (idx + 1).to_string());
 
-        if let Some(token) = provision_token {
-            vars.insert("provision_token".to_string(), token.to_string());
+        if let Some(token) = access_token {
+            vars.insert("access_token".to_string(), token.to_string());
         }
 
         let mut config = serde_json::to_value(&template.machine.config)
@@ -168,7 +168,7 @@ mod tests {
             image = "registry.fly.io/init:latest"
 
             [machine.config.env]
-            PROVISION_TOKEN = "{{provision_token}}"
+            ACCESS_TOKEN = "{{access_token}}"
 
             [metadata]
             role = "{{tenant_id}}"
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].name.as_deref(), Some("tenant-alpha-1"));
         assert_eq!(
-            rendered[0].config["env"]["PROVISION_TOKEN"].as_str(),
+            rendered[0].config["env"]["ACCESS_TOKEN"].as_str(),
             Some("secret")
         );
         assert_eq!(

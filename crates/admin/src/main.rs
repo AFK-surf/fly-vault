@@ -47,7 +47,7 @@ enum TenantCommand {
         #[arg(long)]
         template: PathBuf,
         #[arg(long)]
-        provision_token: Option<String>,
+        access_token: Option<String>,
         /// Additional template variables: --var key=value
         #[arg(long = "var")]
         vars: Vec<String>,
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
             TenantCommand::Create {
                 tenant_id,
                 template,
-                provision_token,
+                access_token,
                 vars,
                 dry_run,
                 wait_timeout_secs,
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
                     &client,
                     &tenant_id,
                     &template,
-                    provision_token.as_deref(),
+                    access_token.as_deref(),
                     &vars,
                     dry_run,
                     Duration::from_secs(wait_timeout_secs),

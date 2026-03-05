@@ -21,7 +21,7 @@ pub async fn create_tenant(
     client: &MachinesClient,
     tenant_id: &str,
     template_path: &Path,
-    provision_token: Option<&str>,
+    access_token: Option<&str>,
     extra_vars: &HashMap<String, String>,
     dry_run: bool,
     wait_timeout: Duration,
@@ -46,7 +46,7 @@ pub async fn create_tenant(
         .and_then(|name| name.to_str())
         .unwrap_or("template");
 
-    let rendered = render_template(&template, tenant_id, provision_token, extra_vars)?;
+    let rendered = render_template(&template, tenant_id, access_token, extra_vars)?;
 
     let mut requests = Vec::with_capacity(rendered.len());
     let mut created_volume_ids = Vec::new();

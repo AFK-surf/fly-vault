@@ -2,15 +2,13 @@ use crate::attest;
 use crate::forward;
 use crate::{Args, SharedState};
 use anyhow::{anyhow, Context, Result};
-use crypto::{XtsKey, XTS_KEY_SIZE};
 use protocol::{
-    AttestationPayload, ControlFrame, VmState, CONTROL_ATTESTATION, CONTROL_ERROR,
-    CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL, CONTROL_PROVISION_TOKEN,
-    CONTROL_RELEASE_KEY, CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONSOLE,
-    STREAM_CONTROL, STREAM_PORT_FORWARD,
+    AttestationPayload, ControlFrame, VmState, CONTROL_ACCESS_TOKEN, CONTROL_ATTESTATION,
+    CONTROL_ERROR, CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL,
+    CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONSOLE, STREAM_CONTROL,
+    STREAM_PORT_FORWARD,
 };
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, ServerConfig};
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -142,8 +140,6 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Handles the control stream for a single connection.
-/// Returns `Ok(true)` if the client successfully authenticated (key verified).
 async fn handle_control_stream(
     conn: &quinn::Connection,
     args: &Args,
@@ -151,7 +147,7 @@ async fn handle_control_stream(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> Result<bool> {
-    let mut pending_key: Option<XtsKey> = None;
+    let mut provided_token: Option<String> = None;
     let mut rootfs_source: Option<RootfsSource> = None;
     let mut token_verified = false;
 
@@ -191,41 +187,106 @@ async fn handle_control_stream(
                     .write_to(send)
                     .await?;
             }
-            CONTROL_PROVISION_TOKEN => {
+            CONTROL_ACCESS_TOKEN => {
                 let client_token =
-                    String::from_utf8(frame.payload).context("provision token not utf-8")?;
-                let guard = shared.lock().await;
-                match &guard.provision_token {
-                    Some(expected) if expected == &client_token => {
-                        drop(guard);
-                        token_verified = true;
-                        info!("provision token accepted");
+                    String::from_utf8(frame.payload).context("access token not utf-8")?;
+
+                let state = {
+                    let guard = shared.lock().await;
+                    guard.vm_state
+                };
+
+                match state {
+                    VmState::Cold => {
+                        let expected = {
+                            let guard = shared.lock().await;
+                            guard.access_token.clone()
+                        };
+
+                        match expected {
+                            Some(expected) if expected == client_token => {
+                                token_verified = true;
+                                provided_token = Some(client_token);
+                                info!("access token accepted for cold boot");
+                            }
+                            Some(_) => {
+                                send_error(send, "access token mismatch".to_string()).await?;
+                                return Ok(false);
+                            }
+                            None => {
+                                send_error(
+                                    send,
+                                    "no ACCESS_TOKEN configured on this machine".to_string(),
+                                )
+                                .await?;
+                                return Ok(false);
+                            }
+                        }
                     }
-                    Some(_) => {
-                        drop(guard);
-                        send_error(send, "provision token mismatch".to_string()).await?;
-                    }
-                    None => {
-                        drop(guard);
-                        send_error(
-                            send,
-                            "no PROVISION_TOKEN configured on this machine".to_string(),
-                        )
-                        .await?;
+                    VmState::Ready => {
+                        let verified = {
+                            let guard = shared.lock().await;
+                            guard.setup.verify_token_hash(&client_token)
+                        };
+
+                        match verified {
+                            Ok(true) => {
+                                token_verified = true;
+                                provided_token = Some(client_token);
+                                info!("access token verified for ready-state session");
+                            }
+                            Ok(false) => {
+                                send_error(send, "access token verification failed".to_string())
+                                    .await?;
+                                return Ok(false);
+                            }
+                            Err(err) => {
+                                send_error(
+                                    send,
+                                    format!("access token verification error: {err:#}"),
+                                )
+                                .await?;
+                                return Ok(false);
+                            }
+                        }
+
+                        if rootfs_source.is_none() {
+                            ControlFrame::new(CONTROL_SETUP_COMPLETE, vec![])
+                                .write_to(send)
+                                .await?;
+                            return Ok(true);
+                        }
                     }
                 }
-            }
-            CONTROL_RELEASE_KEY => {
-                if frame.payload.len() != XTS_KEY_SIZE {
-                    send_error(send, "invalid key length".to_string()).await?;
-                    continue;
-                }
-                pending_key = Some(XtsKey::from_slice(&frame.payload)?);
             }
             CONTROL_PROVISION_ROOTFS => {
+                let state = {
+                    let guard = shared.lock().await;
+                    guard.vm_state
+                };
+                if state == VmState::Cold && !token_verified {
+                    send_error(
+                        send,
+                        "access token required before provisioning rootfs".to_string(),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 rootfs_source = Some(RootfsSource::Inline(frame.payload));
             }
             CONTROL_PROVISION_ROOTFS_URL => {
+                let state = {
+                    let guard = shared.lock().await;
+                    guard.vm_state
+                };
+                if state == VmState::Cold && !token_verified {
+                    send_error(
+                        send,
+                        "access token required before provisioning rootfs".to_string(),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 let rootfs_url =
                     String::from_utf8(frame.payload).context("rootfs url payload not utf-8")?;
                 rootfs_source = Some(RootfsSource::Url(rootfs_url));
@@ -236,91 +297,37 @@ async fn handle_control_stream(
             }
         }
 
-        if let Some(ref key) = pending_key {
-            let state = {
-                let guard = shared.lock().await;
-                guard.vm_state
-            };
+        if !token_verified || rootfs_source.is_none() || provided_token.is_none() {
+            continue;
+        }
 
-            if state == VmState::Ready {
-                let incoming_hash: [u8; 32] = Sha256::digest(key.as_bytes()).into();
-                let guard = shared.lock().await;
-                let verified = guard
-                    .key_hash
-                    .as_ref()
-                    .map_or(false, |stored| stored == &incoming_hash);
+        let rootfs_tarball = match resolve_rootfs_source(rootfs_source.take()).await {
+            Ok(data) => data,
+            Err(err) => {
+                send_error(send, format!("resolve rootfs source failed: {err:#}")).await?;
+                return Ok(false);
+            }
+        };
+
+        let token = provided_token
+            .take()
+            .ok_or_else(|| anyhow!("provided token unexpectedly missing"))?;
+
+        let mut guard = shared.lock().await;
+        match guard.setup.setup_and_prepare(&token, rootfs_tarball).await {
+            Ok(()) => {
+                guard.vm_state = VmState::Ready;
                 drop(guard);
-
-                if verified {
-                    info!("key verified for ready-state reconnect");
-                    ControlFrame::new(CONTROL_SETUP_COMPLETE, vec![])
-                        .write_to(send)
-                        .await?;
-                    return Ok(true);
-                } else {
-                    warn!("key verification failed for ready-state reconnect");
-                    send_error(send, "key verification failed".to_string()).await?;
-                    return Ok(false);
-                }
+                info!("setup complete");
+                ControlFrame::new(CONTROL_SETUP_COMPLETE, vec![])
+                    .write_to(send)
+                    .await?;
+                return Ok(true);
             }
-
-            if state == VmState::Cold && rootfs_source.is_none() {
-                // Cold boot needs both key and rootfs before setup.
-                continue;
-            }
-
-            if state == VmState::Cold && !token_verified {
-                // Cold boot requires a valid provision token before setup.
-                if rootfs_source.is_some() {
-                    send_error(send, "provision token required for cold boot".to_string()).await?;
-                    rootfs_source = None;
-                    pending_key = None;
-                }
-                continue;
-            }
-
-            if state == VmState::Locked && rootfs_source.is_some() && !token_verified {
-                send_error(
-                    send,
-                    "provision token required for re-provisioning".to_string(),
-                )
-                .await?;
-                rootfs_source = None;
-                pending_key = None;
-                continue;
-            }
-
-            let key = pending_key
-                .take()
-                .ok_or_else(|| anyhow!("pending key unexpectedly missing"))?;
-
-            let key_hash: [u8; 32] = Sha256::digest(key.as_bytes()).into();
-            let rootfs_tarball = match resolve_rootfs_source(rootfs_source.take()).await {
-                Ok(data) => data,
-                Err(err) => {
-                    send_error(send, format!("resolve rootfs source failed: {err:#}")).await?;
-                    return Ok(false);
-                }
-            };
-
-            let mut guard = shared.lock().await;
-            match guard.setup.unlock_and_prepare(key, rootfs_tarball).await {
-                Ok(()) => {
-                    guard.vm_state = VmState::Ready;
-                    guard.key_hash = Some(key_hash);
-                    drop(guard);
-                    info!("setup complete, key hash stored");
-                    ControlFrame::new(CONTROL_SETUP_COMPLETE, vec![])
-                        .write_to(send)
-                        .await?;
-                    return Ok(true);
-                }
-                Err(err) => {
-                    guard.vm_state = VmState::Locked;
-                    drop(guard);
-                    send_error(send, format!("setup failed: {err:#}")).await?;
-                    return Ok(false);
-                }
+            Err(err) => {
+                drop(guard);
+                send_error(send, format!("setup failed: {err:#}")).await?;
+                return Ok(false);
             }
         }
     }

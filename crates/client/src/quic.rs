@@ -1,15 +1,13 @@
 use crate::attest;
-use crate::config_verify;
 use crate::console;
 use crate::forward;
 use crate::proxy_udp::ProxyUdpSocket;
 use crate::VaultConfig;
 use anyhow::{anyhow, Context, Result};
-use crypto::XtsKey;
 use protocol::{
-    AttestationPayload, ControlFrame, VmState, CONTROL_ATTESTATION, CONTROL_ERROR,
-    CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL, CONTROL_PROVISION_TOKEN,
-    CONTROL_RELEASE_KEY, CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONTROL,
+    AttestationPayload, ControlFrame, VmState, CONTROL_ACCESS_TOKEN, CONTROL_ATTESTATION,
+    CONTROL_ERROR, CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL,
+    CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONTROL,
 };
 use quinn::{default_runtime, ClientConfig, Endpoint, EndpointConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -24,10 +22,8 @@ use tracing::info;
 pub async fn connect_and_run(
     vault_name: String,
     cfg: VaultConfig,
-    key: XtsKey,
     forwards: Vec<String>,
     reprovision: bool,
-    strict: bool,
 ) -> Result<()> {
     let mut endpoint = build_client_endpoint(cfg.machine_id.clone())?;
     endpoint.set_default_client_config(insecure_client_config()?);
@@ -64,98 +60,37 @@ pub async fn connect_and_run(
         .build()
         .context("build reqwest client")?;
 
-    if strict {
-        let claims = attest::verify_attestation_jwt_strict(
-            &http_client,
-            &attestation.jwt,
-            &cfg.org,
-            &aud,
-            &cfg.allowed_digests,
-        )
-        .await?;
-        assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
-        assert_machine_id(&claims.machine_id, &cfg)?;
-        info!(
-            issuer = %claims.iss,
-            audience = %claims.aud,
-            digest = %claims.image_digest,
-            app = %claims.app_name,
-            machine = %claims.machine_id,
-            version = %claims.machine_version,
-            exp = claims.exp,
-            nbf = ?claims.nbf,
-            "attestation verified (strict)"
-        );
-
-        let api_token = cfg
-            .fly_api_token
-            .clone()
-            .or_else(|| std::env::var("FLY_API_TOKEN").ok())
-            .ok_or_else(|| anyhow!("missing fly api token in config or FLY_API_TOKEN"))?;
-
-        config_verify::verify_machine_config(
-            &http_client,
-            &api_token,
-            &claims.app_name,
-            &claims.machine_id,
-            &claims.machine_version,
-        )
-        .await?;
-    } else {
-        let claims =
-            attest::verify_attestation_jwt_relaxed(&http_client, &attestation.jwt, &cfg.org, &aud)
-                .await?;
-        assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
-        assert_machine_id(&claims.machine_id, &cfg)?;
-        info!(
-            issuer = %claims.iss,
-            app = %claims.app_name,
-            machine = %claims.machine_id,
-            "attestation verified (relaxed: aud+org+app)"
-        );
-    }
+    let claims =
+        attest::verify_attestation_jwt(&http_client, &attestation.jwt, &cfg.org, &aud).await?;
+    assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
+    assert_machine_id(&claims.machine_id, &cfg)?;
+    info!(
+        issuer = %claims.iss,
+        app = %claims.app_name,
+        machine = %claims.machine_id,
+        "attestation verified"
+    );
 
     tracing::info!(state = ?attestation.state, "vm state");
 
+    let access_token = cfg
+        .access_token
+        .clone()
+        .ok_or_else(|| anyhow!("access_token is required"))?;
+
     match attestation.state {
         VmState::Cold => {
-            let token = cfg
-                .provision_token
-                .clone()
-                .ok_or_else(|| anyhow!("provision_token is required for cold boot"))?;
-            ControlFrame::new(CONTROL_PROVISION_TOKEN, token.into_bytes())
+            ControlFrame::new(CONTROL_ACCESS_TOKEN, access_token.into_bytes())
                 .write_to(&mut send)
                 .await?;
-
-            ControlFrame::new(CONTROL_RELEASE_KEY, key.as_bytes().to_vec())
-                .write_to(&mut send)
-                .await?;
-
             send_rootfs_provision(&cfg, &mut send, "cold boot").await?;
             wait_for_setup_complete(&mut recv).await?;
         }
-        VmState::Locked => {
-            if reprovision {
-                let token = cfg
-                    .provision_token
-                    .clone()
-                    .ok_or_else(|| anyhow!("provision_token is required for --reprovision"))?;
-                ControlFrame::new(CONTROL_PROVISION_TOKEN, token.into_bytes())
-                    .write_to(&mut send)
-                    .await?;
-                send_rootfs_provision(&cfg, &mut send, "--reprovision").await?;
-                ControlFrame::new(CONTROL_RELEASE_KEY, key.as_bytes().to_vec())
-                    .write_to(&mut send)
-                    .await?;
-            } else {
-                ControlFrame::new(CONTROL_RELEASE_KEY, key.as_bytes().to_vec())
-                    .write_to(&mut send)
-                    .await?;
-            }
-            wait_for_setup_complete(&mut recv).await?;
-        }
         VmState::Ready => {
-            ControlFrame::new(CONTROL_RELEASE_KEY, key.as_bytes().to_vec())
+            if reprovision {
+                send_rootfs_provision(&cfg, &mut send, "--reprovision").await?;
+            }
+            ControlFrame::new(CONTROL_ACCESS_TOKEN, access_token.into_bytes())
                 .write_to(&mut send)
                 .await?;
             wait_for_setup_complete(&mut recv).await?;
@@ -384,12 +319,10 @@ mod tests {
             org: "test-org".to_string(),
             app: "test-app".to_string(),
             machine_id: machine_id.map(str::to_string),
-            fly_api_token: None,
-            allowed_digests: vec![],
             forward: vec![],
             rootfs: None,
             rootfs_url: None,
-            provision_token: None,
+            access_token: None,
         }
     }
 

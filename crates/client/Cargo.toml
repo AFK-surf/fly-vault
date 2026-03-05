@@ -8,14 +8,12 @@ license.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
-crypto = { path = "../crypto" }
 dirs = "5"
 hex.workspace = true
 http.workspace = true
 jsonwebtoken.workspace = true
 protocol = { path = "../protocol" }
 quinn.workspace = true
-rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

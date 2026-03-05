@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/protocol",
-  "crates/crypto",
   "crates/init",
   "crates/client",
   "crates/admin",
@@ -20,7 +19,6 @@ async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-fuser = { version = "0.17", default-features = false }
 hex = "0.4"
 http = "1"
 jsonwebtoken = "9"
@@ -41,14 +39,9 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 url = "2"
-zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # QUIC stack
 quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
-
-# crypto primitives
-aes = "0.8"
-cipher = "0.4"
 
 # unix helpers
 libc = "0.2"

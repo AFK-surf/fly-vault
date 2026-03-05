@@ -26,12 +26,12 @@ Workspace crates:
 
 `VmState` has two states:
 
-- `Cold`: no provisioning marker (`/data/.access_token_hash`) yet.
+- `Cold`: no provisioning marker (`/data/.provisioned`) yet.
 - `Ready`: provisioning completed at least once.
 
 Transitions:
 
-- `Cold -> Ready`: valid `ACCESS_TOKEN` and rootfs payload accepted, rootfs extracted, token hash written.
+- `Cold -> Ready`: valid `ACCESS_TOKEN` and rootfs payload accepted, rootfs extracted, provisioning marker written.
 - `Ready -> Ready`: reconnect with valid `ACCESS_TOKEN`; optional reprovision with new rootfs payload.
 
 ## 4. Control Protocol
@@ -54,13 +54,13 @@ Control frames used by the provisioning/auth flow:
 2. Client sends `CONTROL_ACCESS_TOKEN`.
 3. `init` checks token against `ACCESS_TOKEN` environment variable.
 4. Client sends rootfs (`CONTROL_PROVISION_ROOTFS` or URL variant).
-5. `init` extracts rootfs, stores `SHA256(ACCESS_TOKEN)` to `/data/.access_token_hash`, enters `Ready`.
+5. `init` extracts rootfs, writes `/data/.provisioned`, enters `Ready`.
 
 ### 5.2 Reconnect (Ready)
 
 1. Client requests and verifies attestation.
 2. Client sends `CONTROL_ACCESS_TOKEN`.
-3. `init` verifies `SHA256(token)` against `/data/.access_token_hash`.
+3. `init` verifies token directly against in-memory `ACCESS_TOKEN`.
 4. Server returns `CONTROL_SETUP_COMPLETE` and enables console/forward streams.
 
 ### 5.3 Reprovision (Ready)
@@ -73,8 +73,7 @@ Control frames used by the provisioning/auth flow:
 
 `crates/init/src/setup.rs`:
 
-- Detects state from `.access_token_hash`.
-- Stores and verifies token hash with SHA-256.
+- Detects state from `.provisioned`.
 - Extracts rootfs tarball into configured root mount dir (`/data/rootfs` by default).
 - Optionally launches inner init in PID+mount namespaces when running outside test mode.
 

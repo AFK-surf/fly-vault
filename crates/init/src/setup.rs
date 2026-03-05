@@ -5,7 +5,6 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::waitpid;
 use nix::unistd::{chdir, execv, pivot_root, Pid};
 use protocol::VmState;
-use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +15,7 @@ use tracing::{info, warn};
 pub struct SetupManager {
     root_mount_dir: PathBuf,
     init_binary: PathBuf,
-    token_hash_file: PathBuf,
+    provisioned_marker_file: PathBuf,
     test_mode: bool,
     runtime: Option<RuntimeState>,
 }
@@ -33,11 +32,11 @@ impl SetupManager {
         init_binary: PathBuf,
         test_mode: bool,
     ) -> Result<Self> {
-        let token_hash_file = data_dir.join(".access_token_hash");
+        let provisioned_marker_file = data_dir.join(".provisioned");
         Ok(Self {
             root_mount_dir,
             init_binary,
-            token_hash_file,
+            provisioned_marker_file,
             test_mode,
             runtime: None,
         })
@@ -56,7 +55,7 @@ impl SetupManager {
     }
 
     pub fn detect_state(&self) -> Result<VmState> {
-        if self.runtime.is_some() || self.token_hash_file.exists() {
+        if self.runtime.is_some() || self.provisioned_marker_file.exists() {
             Ok(VmState::Ready)
         } else {
             Ok(VmState::Cold)
@@ -70,42 +69,13 @@ impl SetupManager {
         self.ensure_runtime_started()
     }
 
-    pub fn verify_token_hash(&self, token: &str) -> Result<bool> {
-        let stored = match fs::read(&self.token_hash_file) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => {
-                return Err(err).with_context(|| format!("read {}", self.token_hash_file.display()))
-            }
-        };
-
-        if stored.len() != 32 {
-            return Err(anyhow!(
-                "invalid access token hash size in {}: got {} expected 32",
-                self.token_hash_file.display(),
-                stored.len()
-            ));
-        }
-
-        let incoming_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        Ok(stored.as_slice() == incoming_hash)
-    }
-
-    pub async fn setup_and_prepare(
-        &mut self,
-        token: &str,
-        rootfs_tarball: Option<Vec<u8>>,
-    ) -> Result<()> {
-        let was_cold = !self.token_hash_file.exists();
+    pub async fn setup_and_prepare(&mut self, rootfs_tarball: Option<Vec<u8>>) -> Result<()> {
+        let was_cold = !self.provisioned_marker_file.exists();
         let is_provisioning = rootfs_tarball.is_some();
         let is_reprovision = !was_cold && is_provisioning;
 
         if was_cold && !is_provisioning {
             return Err(anyhow!("cold boot requires ProvisionRootfs payload"));
-        }
-
-        if !was_cold && !self.verify_token_hash(token)? {
-            return Err(anyhow!("access token hash mismatch"));
         }
 
         if is_reprovision {
@@ -116,7 +86,7 @@ impl SetupManager {
         if self.test_mode {
             if is_provisioning {
                 self.reset_root_mount_dir()?;
-                self.store_token_hash(token)?;
+                self.store_provision_marker()?;
             }
             self.ensure_runtime_started()?;
             return Ok(());
@@ -125,7 +95,7 @@ impl SetupManager {
         if let Some(data) = rootfs_tarball {
             self.reset_root_mount_dir()?;
             extract_rootfs(&self.root_mount_dir, &data)?;
-            self.store_token_hash(token)?;
+            self.store_provision_marker()?;
         }
 
         self.ensure_runtime_started()
@@ -141,10 +111,9 @@ impl SetupManager {
         info!("shutdown: complete");
     }
 
-    fn store_token_hash(&self, token: &str) -> Result<()> {
-        let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        fs::write(&self.token_hash_file, hash)
-            .with_context(|| format!("write {}", self.token_hash_file.display()))
+    fn store_provision_marker(&self) -> Result<()> {
+        fs::write(&self.provisioned_marker_file, b"1")
+            .with_context(|| format!("write {}", self.provisioned_marker_file.display()))
     }
 
     fn ensure_runtime_started(&mut self) -> Result<()> {
@@ -214,12 +183,11 @@ impl SetupManager {
     }
 
     fn clear_provision_marker(&self) -> Result<()> {
-        match fs::remove_file(&self.token_hash_file) {
+        match fs::remove_file(&self.provisioned_marker_file) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => {
-                Err(err).with_context(|| format!("remove {}", self.token_hash_file.display()))
-            }
+            Err(err) => Err(err)
+                .with_context(|| format!("remove {}", self.provisioned_marker_file.display())),
         }
     }
 
@@ -283,69 +251,27 @@ fn child_bootstrap(root: &Path, init_binary: &Path) -> Result<()> {
     )
     .with_context(|| format!("bind-mount new root {}", root.display()))?;
 
-    prepare_mounts(root)?;
-
     let old_root = root.join(".old_root");
-    fs::create_dir_all(&old_root).with_context(|| format!("create {}", old_root.display()))?;
-    pivot_root(root, &old_root)
-        .with_context(|| format!("pivot_root {} {}", root.display(), old_root.display()))?;
-    chdir("/").context("chdir / after pivot_root")?;
-    umount2("/.old_root", MntFlags::MNT_DETACH).context("detach old root")?;
-    fs::remove_dir("/.old_root").context("remove /.old_root")?;
-
-    mount(
-        Some("proc"),
-        "/proc",
-        Some("proc"),
-        MsFlags::empty(),
-        None::<&str>,
-    )
-    .context("mount /proc")?;
-
-    mount(
-        Some("sysfs"),
-        "/sys",
-        Some("sysfs"),
-        MsFlags::empty(),
-        None::<&str>,
-    )
-    .context("mount /sys")?;
-
-    let init = CString::new(init_binary.as_os_str().as_encoded_bytes().to_vec())
-        .context("init path contains NUL")?;
-    execv(&init, &[init.as_c_str()]).context("exec init")?;
-    unreachable!()
-}
-
-fn prepare_mounts(root: &Path) -> Result<()> {
-    let binds = [
-        ("/dev", "dev"),
-        ("/dev/pts", "dev/pts"),
-        ("/dev/shm", "dev/shm"),
-    ];
-    for (src, dst_rel) in binds {
-        let dst = root.join(dst_rel);
-        fs::create_dir_all(&dst).with_context(|| format!("create {}", dst.display()))?;
-        mount(
-            Some(src),
-            dst.as_path(),
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .with_context(|| format!("bind mount {src} -> {}", dst.display()))?;
+    if !old_root.exists() {
+        fs::create_dir_all(&old_root)
+            .with_context(|| format!("create old root dir {}", old_root.display()))?;
     }
 
-    let tmp = root.join("tmp");
-    fs::create_dir_all(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-    mount(
-        Some("tmpfs"),
-        tmp.as_path(),
-        Some("tmpfs"),
-        MsFlags::empty(),
-        Some("size=512m"),
-    )
-    .context("mount tmpfs /tmp")?;
+    pivot_root(root, &old_root).with_context(|| format!("pivot_root to {}", root.display()))?;
 
+    chdir("/").context("chdir /")?;
+
+    umount2("/.old_root", MntFlags::MNT_DETACH).context("umount old root")?;
+    let _ = fs::remove_dir("/.old_root");
+
+    let init_c = CString::new(
+        init_binary
+            .to_str()
+            .ok_or_else(|| anyhow!("init path contains non-utf8"))?,
+    )
+    .context("init cstring")?;
+    let args = [init_c.clone()];
+
+    execv(&init_c, &args).with_context(|| format!("exec {}", init_binary.display()))?;
     Ok(())
 }

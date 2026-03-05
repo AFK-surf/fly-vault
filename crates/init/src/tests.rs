@@ -23,7 +23,7 @@ fn startup_in_ready_state_starts_runtime() -> Result<()> {
     let root_dir = temp.path().join("root");
     std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
     std::fs::create_dir_all(&root_dir).with_context(|| format!("create {}", root_dir.display()))?;
-    std::fs::write(data_dir.join(".access_token_hash"), [0u8; 32]).context("write token hash")?;
+    std::fs::write(data_dir.join(".provisioned"), b"1").context("write provision marker")?;
 
     let mut setup = setup::SetupManager::new(
         data_dir,
@@ -57,7 +57,7 @@ async fn cold_provisioning_resets_existing_rootfs() -> Result<()> {
     )?;
 
     setup
-        .setup_and_prepare("token-a", Some(vec![1, 2, 3]))
+        .setup_and_prepare(Some(vec![1, 2, 3]))
         .await
         .context("cold provision")?;
 
@@ -65,7 +65,7 @@ async fn cold_provisioning_resets_existing_rootfs() -> Result<()> {
         !stale.exists(),
         "rootfs dir should be reset before provisioning"
     );
-    assert!(data_dir.join(".access_token_hash").exists());
+    assert!(data_dir.join(".provisioned").exists());
     Ok(())
 }
 
@@ -84,7 +84,7 @@ async fn reprovisioning_kills_runtime_and_resets_rootfs() -> Result<()> {
         true, // test_mode
     )?;
     setup
-        .setup_and_prepare("token-a", Some(vec![1, 2, 3]))
+        .setup_and_prepare(Some(vec![1, 2, 3]))
         .await
         .context("initial provision")?;
     assert!(setup.runtime_started());
@@ -93,7 +93,7 @@ async fn reprovisioning_kills_runtime_and_resets_rootfs() -> Result<()> {
     std::fs::write(&stale, "old").context("write stale file")?;
 
     setup
-        .setup_and_prepare("token-a", Some(vec![4, 5, 6]))
+        .setup_and_prepare(Some(vec![4, 5, 6]))
         .await
         .context("reprovision")?;
 
@@ -102,7 +102,7 @@ async fn reprovisioning_kills_runtime_and_resets_rootfs() -> Result<()> {
         "rootfs dir should be reset before reprovisioning"
     );
     assert!(setup.runtime_started(), "runtime should be started again");
-    assert!(data_dir.join(".access_token_hash").exists());
+    assert!(data_dir.join(".provisioned").exists());
     Ok(())
 }
 

@@ -147,7 +147,6 @@ async fn handle_control_stream(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> Result<bool> {
-    let mut provided_token: Option<String> = None;
     let mut rootfs_source: Option<RootfsSource> = None;
     let mut token_verified = false;
 
@@ -204,9 +203,10 @@ async fn handle_control_stream(
                         };
 
                         match expected {
-                            Some(expected) if expected == client_token => {
+                            Some(expected)
+                                if token_matches_constant_time(&expected, &client_token) =>
+                            {
                                 token_verified = true;
-                                provided_token = Some(client_token);
                                 info!("access token accepted for cold boot");
                             }
                             Some(_) => {
@@ -224,26 +224,27 @@ async fn handle_control_stream(
                         }
                     }
                     VmState::Ready => {
-                        let verified = {
+                        let expected = {
                             let guard = shared.lock().await;
-                            guard.setup.verify_token_hash(&client_token)
+                            guard.access_token.clone()
                         };
 
-                        match verified {
-                            Ok(true) => {
+                        match expected {
+                            Some(expected)
+                                if token_matches_constant_time(&expected, &client_token) =>
+                            {
                                 token_verified = true;
-                                provided_token = Some(client_token);
                                 info!("access token verified for ready-state session");
                             }
-                            Ok(false) => {
+                            Some(_) => {
                                 send_error(send, "access token verification failed".to_string())
                                     .await?;
                                 return Ok(false);
                             }
-                            Err(err) => {
+                            None => {
                                 send_error(
                                     send,
-                                    format!("access token verification error: {err:#}"),
+                                    "no ACCESS_TOKEN configured on this machine".to_string(),
                                 )
                                 .await?;
                                 return Ok(false);
@@ -297,7 +298,7 @@ async fn handle_control_stream(
             }
         }
 
-        if !token_verified || rootfs_source.is_none() || provided_token.is_none() {
+        if !token_verified || rootfs_source.is_none() {
             continue;
         }
 
@@ -309,12 +310,8 @@ async fn handle_control_stream(
             }
         };
 
-        let token = provided_token
-            .take()
-            .ok_or_else(|| anyhow!("provided token unexpectedly missing"))?;
-
         let mut guard = shared.lock().await;
-        match guard.setup.setup_and_prepare(&token, rootfs_tarball).await {
+        match guard.setup.setup_and_prepare(rootfs_tarball).await {
             Ok(()) => {
                 guard.vm_state = VmState::Ready;
                 drop(guard);
@@ -379,4 +376,30 @@ async fn send_error(send: &mut quinn::SendStream, msg: String) -> Result<()> {
     ControlFrame::new(CONTROL_ERROR, msg.into_bytes())
         .write_to(send)
         .await
+}
+
+fn token_matches_constant_time(expected: &str, provided: &str) -> bool {
+    let expected_bytes = expected.as_bytes();
+    let provided_bytes = provided.as_bytes();
+
+    let mut diff = expected_bytes.len() ^ provided_bytes.len();
+    for (idx, expected_byte) in expected_bytes.iter().enumerate() {
+        let provided_byte = provided_bytes.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(*expected_byte ^ provided_byte);
+    }
+
+    diff == 0
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::token_matches_constant_time;
+
+    #[test]
+    fn token_matches_constant_time_behaves_correctly() {
+        assert!(token_matches_constant_time("secret", "secret"));
+        assert!(!token_matches_constant_time("secret", "secreT"));
+        assert!(!token_matches_constant_time("secret", "short"));
+        assert!(!token_matches_constant_time("secret", "secret-longer"));
+    }
 }

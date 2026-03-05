@@ -12,11 +12,9 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --create-home --uid 10001 vaultproxy
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/vault-proxy /usr/local/bin/vault-proxy
 
-USER 10001:10001
-EXPOSE 8443/udp
-ENTRYPOINT ["/usr/local/bin/vault-proxy"]
+EXPOSE 443/udp
+ENTRYPOINT ["/usr/local/bin/vault-proxy", "--port", "443"]

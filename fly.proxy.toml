@@ -13,8 +13,8 @@ FLY_APP = "vault-tenants-3112"
   memory = 512
 
 [[services]]
-  internal_port = 8443
+  internal_port = 443
   protocol = "udp"
 
   [[services.ports]]
-    port = 8443
+    port = 443

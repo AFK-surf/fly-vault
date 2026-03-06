@@ -77,6 +77,7 @@ rootfs = "~/.config/fly-vault/rootfs/dev-env.tar.gz"
 fly-vault connect <vault-name>
 fly-vault connect <vault-name> --forward 3000:localhost:3000
 fly-vault connect <vault-name> --reprovision
+fly-vault exec <vault-name> -- ls -lash /
 fly-vault build
 ```
 
@@ -86,6 +87,7 @@ For local development via Cargo:
 
 ```bash
 cargo run -p fly-vault -- connect <vault-name>
+cargo run -p fly-vault -- exec <vault-name> -- uname -a
 ```
 
 ## Deployment Admin CLI (`fly-vault-admin`)

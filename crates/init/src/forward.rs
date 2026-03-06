@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use nix::unistd::Pid;
-use protocol::{decode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXIT, CONSOLE_RESIZE};
+use protocol::{
+    decode_exec_argv, decode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_EXIT,
+    CONSOLE_RESIZE, CONSOLE_SHELL,
+};
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
@@ -69,45 +72,39 @@ pub async fn handle_console_stream(
     root_dir: &Path,
     inner_pid: Pid,
 ) -> Result<()> {
-    let shell = if root_dir.join("bin/bash").exists() {
-        "/bin/bash"
-    } else {
-        "/bin/sh"
+    let launch = match ConsoleFrame::read_from(&mut recv).await? {
+        ConsoleFrame {
+            ty: CONSOLE_SHELL,
+            ..
+        } => ConsoleLaunch::Shell,
+        ConsoleFrame {
+            ty: CONSOLE_EXEC,
+            payload,
+        } => {
+            let argv = decode_exec_argv(&payload)?;
+            if argv.is_empty() {
+                return Err(anyhow!("exec request must include at least one argv element"));
+            }
+            ConsoleLaunch::Exec(argv)
+        }
+        frame => {
+            return Err(anyhow!(
+                "unexpected initial console frame type: {}",
+                frame.ty
+            ));
+        }
     };
 
     let (master_fd, slave_fd) = open_pty().context("allocate pty pair")?;
 
-    // Spawn shell with the slave side as its controlling terminal.
+    // Spawn the requested program with the slave side as its controlling terminal.
     // When an inner init is running in PID+mount namespaces, use nsenter to
     // join those namespaces so the console sees the same /proc and mounts.
-    let slave_raw = slave_fd.as_raw_fd();
-    let mut cmd = Command::new("nsenter");
-    cmd.args([
-        "-m",
-        "-p",
-        "-t",
-        &inner_pid.as_raw().to_string(),
-        &format!("--wd={}", root_dir.display()),
-        shell,
-        "-l",
-    ]);
-    unsafe {
-        cmd.stdin(Stdio::from_raw_fd(dup_fd(slave_raw)?));
-        cmd.stdout(Stdio::from_raw_fd(dup_fd(slave_raw)?));
-        cmd.stderr(Stdio::from_raw_fd(dup_fd(slave_raw)?));
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    let mut cmd = build_console_command(&launch, root_dir, inner_pid);
+    configure_console_stdio(&mut cmd, &slave_fd)?;
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn nsenter console via pid {}", inner_pid.as_raw()))?;
+        .with_context(|| launch.spawn_context(inner_pid))?;
 
     // Close slave in parent — the child has its own copies.
     drop(slave_fd);
@@ -178,6 +175,74 @@ pub async fn handle_console_stream(
         .await?;
     send.finish().context("finish console stream")?;
 
+    Ok(())
+}
+
+enum ConsoleLaunch {
+    Shell,
+    Exec(Vec<String>),
+}
+
+impl ConsoleLaunch {
+    fn shell_path(root_dir: &Path) -> &'static str {
+        if root_dir.join("bin/bash").exists() {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        }
+    }
+
+    fn spawn_context(&self, inner_pid: Pid) -> String {
+        match self {
+            Self::Shell => format!("spawn nsenter console via pid {}", inner_pid.as_raw()),
+            Self::Exec(argv) => format!(
+                "spawn nsenter exec {:?} via pid {}",
+                argv,
+                inner_pid.as_raw()
+            ),
+        }
+    }
+}
+
+fn build_console_command(launch: &ConsoleLaunch, root_dir: &Path, inner_pid: Pid) -> Command {
+    let mut cmd = Command::new("nsenter");
+    cmd.args([
+        "-m",
+        "-p",
+        "-t",
+        &inner_pid.as_raw().to_string(),
+        &format!("--wd={}", root_dir.display()),
+        "--",
+    ]);
+
+    match launch {
+        ConsoleLaunch::Shell => {
+            cmd.args([ConsoleLaunch::shell_path(root_dir), "-l"]);
+        }
+        ConsoleLaunch::Exec(argv) => {
+            cmd.args(argv);
+        }
+    }
+
+    cmd
+}
+
+fn configure_console_stdio(cmd: &mut Command, slave_fd: &OwnedFd) -> Result<()> {
+    let slave_raw = slave_fd.as_raw_fd();
+    unsafe {
+        cmd.stdin(Stdio::from_raw_fd(dup_fd(slave_raw)?));
+        cmd.stdout(Stdio::from_raw_fd(dup_fd(slave_raw)?));
+        cmd.stderr(Stdio::from_raw_fd(dup_fd(slave_raw)?));
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     Ok(())
 }
 
@@ -327,6 +392,7 @@ fn set_pty_winsize(fd: libc::c_int, rows: u16, cols: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
 
@@ -372,6 +438,28 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn build_console_command_preserves_exec_argv() {
+        let cmd = build_console_command(
+            &ConsoleLaunch::Exec(vec!["ls".to_string(), "-lash".to_string(), "/".to_string()]),
+            Path::new("/tmp/rootfs"),
+            Pid::from_raw(42),
+        );
+
+        let args = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "-m", "-p", "-t", "42", "--wd=/tmp/rootfs", "--", "ls", "-lash", "/",
+            ]
+        );
     }
 }
 

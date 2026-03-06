@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 
@@ -27,6 +28,11 @@ enum Command {
         /// Re-provision the vault with a new rootfs while in ready state.
         #[arg(long)]
         reprovision: bool,
+    },
+    Exec {
+        vault: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
     },
     Build,
 }
@@ -69,11 +75,8 @@ async fn main() -> Result<()> {
             forward,
             reprovision,
         } => {
-            let (config_path, mut cfg_file) = load_config_file()?;
-            let vault_cfg = cfg_file
-                .vault
-                .remove(&vault)
-                .ok_or_else(|| anyhow!("vault {vault} not found in {}", config_path.display()))?;
+            let (_, mut cfg_file) = load_config_file()?;
+            let vault_cfg = resolve_vault_config(&mut cfg_file, &vault)?;
 
             let forwards = if forward.is_empty() {
                 vault_cfg.forward.clone()
@@ -81,7 +84,23 @@ async fn main() -> Result<()> {
                 forward
             };
 
-            quic::connect_and_run(vault, vault_cfg, forwards, reprovision).await?;
+            quic::connect_and_run(vault_cfg, forwards, reprovision).await?;
+        }
+        Command::Exec { vault, command } => {
+            let (_, mut cfg_file) = load_config_file()?;
+            let vault_cfg = resolve_vault_config(&mut cfg_file, &vault)?;
+            let command = command
+                .into_iter()
+                .map(|arg| {
+                    arg.into_string().map_err(|arg| {
+                        anyhow!("exec arguments must be valid UTF-8: {:?}", arg)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let exit_code = quic::connect_and_exec(vault_cfg, command).await?;
+            if exit_code != 0 {
+                std::process::exit((exit_code & 0xff) as i32);
+            }
         }
         Command::Build => {
             run_build_commands()?;
@@ -125,9 +144,25 @@ fn config_path() -> Result<PathBuf> {
     Ok(base.join("fly-vault").join("config.toml"))
 }
 
+fn resolve_vault_config(
+    cfg_file: &mut ConfigFile,
+    vault: &str,
+) -> Result<VaultConfig> {
+    cfg_file.vault.remove(vault).ok_or_else(|| {
+        anyhow!(
+            "vault {vault} not found in {}",
+            config_path()
+                .unwrap_or_else(|_| PathBuf::from("<unknown-config>"))
+                .display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::VaultConfig;
+    use super::{resolve_vault_config, Cli, Command, ConfigFile, VaultConfig};
+    use clap::Parser;
+    use std::collections::HashMap;
 
     #[test]
     fn vault_config_deserializes_with_machine_id() {
@@ -150,5 +185,68 @@ app = "my-app"
 "#;
         let cfg: VaultConfig = toml::from_str(raw).expect("parse config without machine_id");
         assert!(cfg.machine_id.is_none());
+    }
+
+    #[test]
+    fn resolve_vault_config_finds_named_entry() {
+        let mut cfg = ConfigFile {
+            vault: HashMap::from([(
+                "my-dev".to_string(),
+                VaultConfig {
+                    address: "proxy.fly.dev:8443".to_string(),
+                    org: "org".to_string(),
+                    app: "app".to_string(),
+                    machine_id: None,
+                    forward: Vec::new(),
+                    rootfs: None,
+                    rootfs_url: None,
+                    access_token: None,
+                },
+            )]),
+        };
+
+        let resolved = resolve_vault_config(&mut cfg, "my-dev").expect("resolve named vault");
+        assert_eq!(resolved.app, "app");
+    }
+
+    #[test]
+    fn resolve_vault_config_reports_missing_name() {
+        let vault_cfg = VaultConfig {
+            address: "proxy.fly.dev:8443".to_string(),
+            org: "org".to_string(),
+            app: "app".to_string(),
+            machine_id: None,
+            forward: Vec::new(),
+            rootfs: None,
+            rootfs_url: None,
+            access_token: None,
+        };
+        let mut cfg = ConfigFile {
+            vault: HashMap::from([
+                ("one".to_string(), vault_cfg.clone()),
+                ("two".to_string(), vault_cfg),
+            ]),
+        };
+
+        let err = resolve_vault_config(&mut cfg, "missing").expect_err("expected missing vault");
+        assert!(err.to_string().contains("vault missing not found"));
+    }
+
+    #[test]
+    fn exec_command_parses_vault_and_trailing_command() {
+        let cli = Cli::try_parse_from(["fly-vault", "exec", "my-dev", "--", "ls", "-lash", "/"])
+            .expect("parse exec command");
+
+        match cli.command {
+            Command::Exec { vault, command } => {
+                assert_eq!(vault, "my-dev");
+                let command = command
+                    .into_iter()
+                    .map(|arg| arg.into_string().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(command, vec!["ls", "-lash", "/"]);
+            }
+            other => panic!("expected exec command, got {other:?}"),
+        }
     }
 }

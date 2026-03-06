@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use protocol::{
-    decode_exit, encode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXIT, CONSOLE_RESIZE,
-    STREAM_CONSOLE,
+    decode_exit, encode_exec_argv, encode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXEC,
+    CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL, STREAM_CONSOLE,
 };
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -9,10 +9,21 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncWriteExt;
 
 pub async fn run_console(conn: quinn::Connection) -> Result<()> {
+    let exit_code = run_session(conn, ConsoleFrame::new(CONSOLE_SHELL, vec![])).await?;
+    eprintln!("\r\nremote shell exited with {exit_code}");
+    Ok(())
+}
+
+pub async fn run_exec(conn: quinn::Connection, argv: Vec<String>) -> Result<u32> {
+    run_session(conn, ConsoleFrame::new(CONSOLE_EXEC, encode_exec_argv(&argv))).await
+}
+
+async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u32> {
     let (mut send, mut recv) = conn.open_bi().await.context("open console stream")?;
     send.write_u8(STREAM_CONSOLE)
         .await
         .context("write console stream tag")?;
+    startup.write_to(&mut send).await?;
 
     let is_tty = std::io::stdin().is_terminal();
     let _raw_guard = if is_tty {
@@ -27,11 +38,9 @@ pub async fn run_console(conn: quinn::Connection) -> Result<()> {
         None
     };
 
-    // Channel lets both stdin and resize signal write frames without aliasing
-    // the send stream.
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<ConsoleFrame>(64);
 
-    let stdin_task = {
+    let stdin_task = tokio::spawn({
         let tx = frame_tx.clone();
         async move {
             let stdin = open_nonblocking_stdin().context("open nonblocking stdin")?;
@@ -47,18 +56,18 @@ pub async fn run_console(conn: quinn::Connection) -> Result<()> {
             }
             Ok::<(), anyhow::Error>(())
         }
-    };
+    });
 
-    let resize_task = {
+    let resize_task = tokio::spawn({
         let tx = frame_tx;
         async move {
             if !is_tty {
-                return std::future::pending::<()>().await;
+                return Ok::<(), anyhow::Error>(());
             }
             let Ok(mut sig) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
             else {
-                return std::future::pending::<()>().await;
+                return Ok(());
             };
             loop {
                 sig.recv().await;
@@ -72,16 +81,17 @@ pub async fn run_console(conn: quinn::Connection) -> Result<()> {
                 }
             }
         }
-    };
+    });
 
-    let send_task = async {
+    let send_task = tokio::spawn(async move {
         while let Some(frame) = frame_rx.recv().await {
             frame.write_to(&mut send).await?;
         }
+        send.finish().context("finish console send")?;
         Ok::<(), anyhow::Error>(())
-    };
+    });
 
-    let recv_task = async {
+    let exit_result: Result<u32> = async {
         let mut stdout = tokio::io::stdout();
         loop {
             let frame = ConsoleFrame::read_from(&mut recv).await?;
@@ -94,25 +104,31 @@ pub async fn run_console(conn: quinn::Connection) -> Result<()> {
                     stdout.flush().await.context("flush stdout")?;
                 }
                 CONSOLE_EXIT => {
-                    let code = decode_exit(&frame.payload)?;
-                    eprintln!("\r\nremote shell exited with {code}");
-                    break;
+                    return decode_exit(&frame.payload);
                 }
                 _ => {}
             }
         }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    tokio::select! {
-        r = stdin_task => r?,
-        _ = resize_task => {}
-        r = send_task => r?,
-        r = recv_task => r?,
     }
+    .await;
 
-    send.finish().context("finish console send")?;
-    Ok(())
+    stdin_task.abort();
+    resize_task.abort();
+
+    match stdin_task.await {
+        Ok(result) => result?,
+        Err(err) if err.is_cancelled() => {}
+        Err(err) => return Err(err).context("join stdin task"),
+    }
+    match resize_task.await {
+        Ok(result) => result?,
+        Err(err) if err.is_cancelled() => {}
+        Err(err) => return Err(err).context("join resize task"),
+    }
+    send_task.await.context("join send task")??;
+
+    let exit_code = exit_result?;
+    Ok(exit_code)
 }
 
 /// RAII guard that restores the original terminal settings on drop.

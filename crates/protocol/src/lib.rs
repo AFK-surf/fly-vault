@@ -18,6 +18,8 @@ pub const CONTROL_PROVISION_ROOTFS_URL: u8 = 0x08;
 pub const CONSOLE_DATA: u8 = 0x00;
 pub const CONSOLE_RESIZE: u8 = 0x01;
 pub const CONSOLE_EXIT: u8 = 0x02;
+pub const CONSOLE_SHELL: u8 = 0x03;
+pub const CONSOLE_EXEC: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -191,4 +193,59 @@ pub fn decode_exit(data: &[u8]) -> Result<u32> {
         return Err(anyhow!("invalid exit payload length: {}", data.len()));
     }
     Ok(u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
+}
+
+pub fn encode_exec_argv(argv: &[String]) -> Vec<u8> {
+    let mut out = BytesMut::new();
+    out.put_u32(argv.len() as u32);
+    for arg in argv {
+        out.put_u32(arg.len() as u32);
+        out.extend_from_slice(arg.as_bytes());
+    }
+    out.to_vec()
+}
+
+pub fn decode_exec_argv(mut data: &[u8]) -> Result<Vec<String>> {
+    if data.remaining() < 4 {
+        return Err(anyhow!("exec argv payload too short"));
+    }
+
+    let argc = data.get_u32() as usize;
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if data.remaining() < 4 {
+            return Err(anyhow!("exec argv length prefix truncated"));
+        }
+        let len = data.get_u32() as usize;
+        if data.remaining() < len {
+            return Err(anyhow!("exec argv element truncated"));
+        }
+        let arg = String::from_utf8(data[..len].to_vec()).context("exec argv not utf-8")?;
+        data.advance(len);
+        argv.push(arg);
+    }
+
+    if data.has_remaining() {
+        return Err(anyhow!("exec argv payload has trailing bytes"));
+    }
+
+    Ok(argv)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_exec_argv, encode_exec_argv};
+
+    #[test]
+    fn exec_argv_round_trips() {
+        let argv = vec!["ls".to_string(), "-lash".to_string(), "/".to_string()];
+        let encoded = encode_exec_argv(&argv);
+        assert_eq!(decode_exec_argv(&encoded).unwrap(), argv);
+    }
+
+    #[test]
+    fn exec_argv_rejects_truncated_payload() {
+        let err = decode_exec_argv(&[0, 0, 0, 1, 0, 0, 0]).unwrap_err();
+        assert!(err.to_string().contains("length prefix truncated"));
+    }
 }

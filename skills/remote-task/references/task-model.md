@@ -4,12 +4,12 @@
 
 This skill treats the `fly-vault` console as a transport for a simple task registry.
 
-In the current design, the console is mainly a bootstrap transport. The steady-state control path is:
+In the current design, the console protocol is reached through `fly-vault exec`. The steady-state control path is:
 
 1. upload or refresh the VM-side `remote_task_service.py`
 2. start that service inside the VM
-3. create a local `fly-vault --forward` tunnel to the service's localhost port
-4. manage tasks over the forwarded HTTP interface
+3. invoke later `fly-vault exec` commands that call the service over `127.0.0.1` inside the VM
+4. manage tasks through the service's HTTP interface without opening a separate local tunnel
 
 The registry exists only inside the provisioned rootfs. That means:
 

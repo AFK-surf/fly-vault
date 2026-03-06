@@ -19,12 +19,29 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
-pub async fn connect_and_run(
-    vault_name: String,
-    cfg: VaultConfig,
-    forwards: Vec<String>,
-    reprovision: bool,
-) -> Result<()> {
+pub async fn connect_and_run(cfg: VaultConfig, forwards: Vec<String>, reprovision: bool) -> Result<()> {
+    let conn = connect_ready(&cfg, reprovision).await?;
+
+    if forwards.is_empty() {
+        console::run_console(conn).await?;
+    } else {
+        let console_conn = conn.clone();
+        tokio::spawn(async move {
+            let _ = console::run_console(console_conn).await;
+        });
+
+        forward::run_local_forwarders(conn, forwards).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn connect_and_exec(cfg: VaultConfig, command: Vec<String>) -> Result<u32> {
+    let conn = connect_ready(&cfg, false).await?;
+    console::run_exec(conn, command).await
+}
+
+async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Connection> {
     let mut endpoint = build_client_endpoint(cfg.machine_id.clone())?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
@@ -97,19 +114,7 @@ pub async fn connect_and_run(
         }
     }
 
-    if forwards.is_empty() {
-        console::run_console(conn).await?;
-    } else {
-        let console_conn = conn.clone();
-        tokio::spawn(async move {
-            let _ = console::run_console(console_conn).await;
-        });
-
-        forward::run_local_forwarders(conn, forwards).await?;
-    }
-
-    let _ = vault_name;
-    Ok(())
+    Ok(conn)
 }
 
 async fn send_rootfs_provision(

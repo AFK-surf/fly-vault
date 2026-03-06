@@ -6,15 +6,11 @@ import os
 import platform
 import re
 import shlex
-import signal
-import socket
 import subprocess
 import sys
 import textwrap
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 BEGIN_MARKER = "__FV_REMOTE_TASK_BEGIN__"
@@ -22,7 +18,6 @@ END_MARKER = "__FV_REMOTE_TASK_END__"
 DEFAULT_TASK_ROOT = "/var/lib/fly-vault/remote-task"
 SERVICE_SESSION = "fv-remote-task-service"
 SERVICE_DIR_NAME = ".service"
-TUNNEL_WAIT_SECONDS = 8.0
 HEALTH_TIMEOUT_SECONDS = 1.5
 LIST_COLUMNS = [
     "task_id",
@@ -117,7 +112,7 @@ def parse_args():
 
     attach = subparsers.add_parser(
         "attach-snippet",
-        help="Print the tmux snippet to paste into an interactive fly-vault shell.",
+        help="Print the tmux snippet to run through fly-vault exec.",
     )
     add_vault(attach)
     attach.add_argument("--task", required=True, help="Task id.")
@@ -167,20 +162,6 @@ def shell_heredoc(target_expr, body, label):
     return f"cat <<'{marker}' > {target_expr}\n{body}{marker}\n"
 
 
-def cache_root():
-    base = Path.home() / ".cache" / "fly-vault" / "remote-task"
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def tunnel_state_path(vault):
-    return cache_root() / f"{vault}.json"
-
-
-def tunnel_log_path(vault):
-    return cache_root() / f"{vault}.log"
-
-
 def service_script_path():
     return Path(__file__).resolve().with_name("remote_task_service.py")
 
@@ -212,29 +193,41 @@ def extract_marked_output(raw_output):
     return raw_output[start:end]
 
 
-def run_bootstrap_capture(fly_vault_bin, vault, remote_script):
-    cmd = fly_vault_command(fly_vault_bin) + ["connect", vault]
+def run_remote_exec_capture(fly_vault_bin, vault, remote_script, purpose):
+    cmd = fly_vault_command(fly_vault_bin) + [
+        "exec",
+        vault,
+        "--",
+        "/bin/sh",
+        "-lc",
+        remote_script,
+    ]
     completed = subprocess.run(
         cmd,
-        input=remote_script,
         text=True,
         capture_output=True,
     )
     payload = extract_marked_output(completed.stdout)
     if payload is None:
         raise SystemExit(
-            "remote-task bootstrap did not receive the expected payload markers.\n"
+            f"remote-task {purpose} did not receive the expected payload markers.\n"
+            "transport: fly-vault exec\n"
             f"fly-vault exit code: {completed.returncode}\n"
             f"stdout snippet:\n{snippet(completed.stdout)}\n"
             f"stderr snippet:\n{snippet(completed.stderr)}\n"
-            "Hint: inspect raw `fly-vault connect` output or retry `doctor`."
+            "Hint: inspect raw fly-vault output or retry `doctor`."
         )
     return {
         "returncode": completed.returncode,
         "payload": payload,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
+        "transport": "fly-vault exec",
     }
+
+
+def run_bootstrap_capture(fly_vault_bin, vault, remote_script):
+    return run_remote_exec_capture(fly_vault_bin, vault, remote_script, "bootstrap")
 
 
 def parse_bootstrap_payload(payload):
@@ -246,122 +239,75 @@ def parse_bootstrap_payload(payload):
     return data
 
 
-def choose_local_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def build_service_request_script(task_root, method, path, body=None, timeout=HEALTH_TIMEOUT_SECONDS):
+    service_dir = f"{task_root.rstrip('/')}/{SERVICE_DIR_NAME}"
+    meta_dir = f"{service_dir}/meta"
+    service_port_file = f"{meta_dir}/service_port.txt"
+    body_json = "" if body is None else json.dumps(body)
+
+    return textwrap.dedent(
+        f"""\
+        set -eu
+        export PS1=
+        SERVICE_PORT_FILE={shell_quote(service_port_file)}
+        METHOD={shell_quote(method)}
+        PATH_INFO={shell_quote(path)}
+        BODY_JSON={shell_quote(body_json)}
+        REQUEST_TIMEOUT={shell_quote(str(timeout))}
+
+        fv_begin() {{
+          printf '%s\\n' {shell_quote(BEGIN_MARKER)}
+        }}
+
+        fv_end() {{
+          printf '%s\\n' {shell_quote(END_MARKER)}
+        }}
+
+        if [ ! -f "$SERVICE_PORT_FILE" ]; then
+          echo "service port file is missing: $SERVICE_PORT_FILE" >&2
+          exit 1
+        fi
+
+        fv_begin
+        python3 <<'PY'
+import json
+import os
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+port = Path(os.environ["SERVICE_PORT_FILE"]).read_text().strip()
+url = f"http://127.0.0.1:{{port}}{{os.environ['PATH_INFO']}}"
+body_json = os.environ["BODY_JSON"]
+data = body_json.encode() if body_json else None
+headers = {{"Content-Type": "application/json"}} if body_json else {{}}
+request = Request(url, data=data, headers=headers, method=os.environ["METHOD"])
+with urlopen(request, timeout=float(os.environ["REQUEST_TIMEOUT"])) as response:
+    print(response.read().decode(), end="")
+PY
+        fv_end
+        """
+    )
 
 
-def process_alive(pid):
-    if not pid:
-        return False
+def service_request(args, method, path, body=None, timeout=HEALTH_TIMEOUT_SECONDS):
+    completed = run_remote_exec_capture(
+        args.fly_vault_bin,
+        args.vault,
+        build_service_request_script(args.task_root, method, path, body=body, timeout=timeout),
+        "service request",
+    )
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+        return json.loads(completed["payload"])
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"remote-task service returned invalid JSON: {exc}") from exc
 
 
-def load_tunnel_state(vault):
-    path = tunnel_state_path(vault)
-    if not path.exists():
-        return None
+def service_health_ok(args):
     try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return None
-
-
-def save_tunnel_state(vault, state):
-    tunnel_state_path(vault).write_text(json.dumps(state, indent=2, sort_keys=True))
-
-
-def remove_tunnel_state(vault):
-    path = tunnel_state_path(vault)
-    if path.exists():
-        path.unlink()
-
-
-def stop_tunnel_process(state):
-    pid = state.get("pid")
-    if not process_alive(pid):
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
-
-
-def service_request(base_url, method, path, body=None, timeout=HEALTH_TIMEOUT_SECONDS):
-    url = base_url.rstrip("/") + path
-    data = None
-    headers = {}
-    if body is not None:
-        data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode())
-
-
-def service_health_ok(base_url):
-    try:
-        data = service_request(base_url, "GET", "/health")
-    except (urllib.error.URLError, TimeoutError, ValueError, ConnectionError):
+        data = service_request(args, "GET", "/health")
+    except SystemExit:
         return False
     return bool(data.get("ok"))
-
-
-def ensure_local_tunnel(args, remote_port):
-    state = load_tunnel_state(args.vault)
-    if state and process_alive(state.get("pid")) and state.get("remote_port") == remote_port:
-        base_url = f"http://127.0.0.1:{state['local_port']}"
-        if service_health_ok(base_url):
-            return base_url
-        stop_tunnel_process(state)
-        remove_tunnel_state(args.vault)
-
-    local_port = choose_local_port()
-    cmd = fly_vault_command(args.fly_vault_bin) + [
-        "connect",
-        args.vault,
-        "--forward",
-        f"{local_port}:127.0.0.1:{remote_port}",
-    ]
-    log_path = tunnel_log_path(args.vault)
-    log_handle = open(log_path, "ab")
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    state = {
-        "pid": process.pid,
-        "local_port": local_port,
-        "remote_port": remote_port,
-        "log_path": str(log_path),
-    }
-    save_tunnel_state(args.vault, state)
-
-    base_url = f"http://127.0.0.1:{local_port}"
-    deadline = time.time() + TUNNEL_WAIT_SECONDS
-    while time.time() < deadline:
-        if service_health_ok(base_url):
-            return base_url
-        if process.poll() is not None:
-            break
-        time.sleep(0.2)
-
-    log_excerpt = ""
-    if log_path.exists():
-        log_excerpt = snippet(log_path.read_text(errors="replace"))
-    raise SystemExit(
-        "remote-task tunnel did not become healthy.\n"
-        f"local port: {local_port}\n"
-        f"remote port: {remote_port}\n"
-        f"tunnel log snippet:\n{log_excerpt}"
-    )
 
 
 def build_bootstrap_script(task_root):
@@ -453,11 +399,8 @@ def build_bootstrap_script(task_root):
 
 
 def ensure_service(args):
-    state = load_tunnel_state(args.vault)
-    if state and process_alive(state.get("pid")):
-        base_url = f"http://127.0.0.1:{state['local_port']}"
-        if service_health_ok(base_url):
-            return base_url
+    if service_health_ok(args):
+        return
 
     bootstrap = run_bootstrap_capture(
         args.fly_vault_bin,
@@ -471,7 +414,8 @@ def ensure_service(args):
             f"reason: {data.get('ERROR', 'unknown error')}\n"
             f"log tail: {data.get('LOG_TAIL', '')}"
         )
-    return ensure_local_tunnel(args, int(data["REMOTE_PORT"]))
+    if not service_health_ok(args):
+        raise SystemExit("remote-task service did not become healthy after bootstrap")
 
 
 def emit_json(data):
@@ -493,9 +437,9 @@ def print_task_summary(record):
 
 
 def do_spawn(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     data = service_request(
-        base_url,
+        args,
         "POST",
         "/spawn",
         {
@@ -519,8 +463,8 @@ def do_spawn(args):
 
 
 def do_list(args):
-    base_url = ensure_service(args)
-    data = service_request(base_url, "GET", "/tasks")
+    ensure_service(args)
+    data = service_request(args, "GET", "/tasks")
     if args.json:
         emit_json(data)
         return
@@ -540,9 +484,9 @@ def do_list(args):
 
 
 def do_show(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     data = service_request(
-        base_url,
+        args,
         "GET",
         "/task?" + urllib.parse.urlencode({"task": args.task}),
     )
@@ -558,12 +502,12 @@ def do_show(args):
 
 
 def do_logs(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     if args.follow:
         offset = 0
         while True:
             data = service_request(
-                base_url,
+                args,
                 "GET",
                 "/log-chunk?"
                 + urllib.parse.urlencode({"task": args.task, "offset": offset}),
@@ -578,7 +522,7 @@ def do_logs(args):
             offset = data.get("next_offset", offset)
             time.sleep(args.poll_interval)
     data = service_request(
-        base_url,
+        args,
         "GET",
         "/logs?" + urllib.parse.urlencode({"task": args.task, "lines": args.lines}),
     )
@@ -591,9 +535,9 @@ def do_logs(args):
 
 
 def do_attach_snippet(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     data = service_request(
-        base_url,
+        args,
         "GET",
         "/attach-snippet?" + urllib.parse.urlencode({"task": args.task}),
     )
@@ -606,9 +550,9 @@ def do_attach_snippet(args):
 
 
 def do_doctor(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     data = service_request(
-        base_url,
+        args,
         "GET",
         "/doctor?" + urllib.parse.urlencode({"cwd": args.cwd}),
     )
@@ -622,9 +566,9 @@ def do_doctor(args):
 
 
 def do_repair(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     data = service_request(
-        base_url,
+        args,
         "POST",
         "/repair",
         {"task": args.task},
@@ -640,9 +584,9 @@ def do_repair(args):
 
 
 def do_send_keys(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     data = service_request(
-        base_url,
+        args,
         "POST",
         "/send-keys",
         {"task": args.task, "keys": args.keys, "enter": args.enter},
@@ -656,9 +600,9 @@ def do_send_keys(args):
 
 
 def do_capture_pane(args):
-    base_url = ensure_service(args)
+    ensure_service(args)
     data = service_request(
-        base_url,
+        args,
         "GET",
         "/capture-pane?"
         + urllib.parse.urlencode({"task": args.task, "lines": args.lines}),

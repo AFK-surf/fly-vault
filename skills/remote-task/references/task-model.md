@@ -4,6 +4,13 @@
 
 This skill treats the `fly-vault` console as a transport for a simple task registry.
 
+In the current design, the console is mainly a bootstrap transport. The steady-state control path is:
+
+1. upload or refresh the VM-side `remote_task_service.py`
+2. start that service inside the VM
+3. create a local `fly-vault --forward` tunnel to the service's localhost port
+4. manage tasks over the forwarded HTTP interface
+
 The registry exists only inside the provisioned rootfs. That means:
 
 - reconnects preserve task state
@@ -51,6 +58,12 @@ Files:
     session_name.txt        # tmux only
     summary.txt
     why.txt
+
+.service/
+  remote_task_service.py
+  service.log
+  meta/
+    service_port.txt
 ```
 
 ## Required Metadata
@@ -78,6 +91,7 @@ Use for all remote tasks created by this skill:
 Properties:
 
 - requires `tmux` on the remote image and is the only supported mode
+- requires `python3` on the remote image for the control service
 - allows later `tmux attach -t <session-name>`
 - still keeps durable metadata and logs
 

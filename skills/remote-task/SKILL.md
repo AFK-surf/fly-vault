@@ -14,13 +14,15 @@ Use this skill when `fly-vault` should be treated as a remote task transport rat
 - an authenticated console session
 - optional TCP forwards
 
-It does not provide a remote job API. This skill layers a small task registry on top of the console channel so another agent instance can:
+It does not provide a remote job API. This skill layers a VM-side control service on top of the console channel and then talks to that service through `fly-vault` port forwarding, so another agent instance can:
 
 - start more than one remote task at a time
 - persist task context across reconnects and agent turnover
 - recover task state later without guessing why a process exists
+- drive tmux sessions non-interactively without rendering a full-screen terminal
 
 The default interface is [scripts/fly_vault_remote_task.py](./scripts/fly_vault_remote_task.py).
+The VM-side service implementation is [scripts/remote_task_service.py](./scripts/remote_task_service.py).
 
 Read [references/task-model.md](./references/task-model.md) when you need the exact on-disk layout or need to change how tasks are managed.
 
@@ -42,6 +44,7 @@ Relevant pieces:
 - `fly-vault`: the local CLI the agent invokes
 - `init`: the VM-side server already running inside the remote machine
 - shared protocol semantics: control messages for attestation, authentication, and setup, plus separate console and port-forward streams
+- the remote-task control service: a small HTTP service started inside the VM and exposed locally through a forwarded localhost port
 
 Operational model:
 
@@ -59,11 +62,11 @@ VM lifecycle:
 What matters for remote tasks:
 
 - The console stream opens a fresh shell each time. There is no built-in remote job or session registry.
-- Port forwarding exists, but this skill does not depend on it.
+- Port forwarding exists and is the preferred interaction path after the service has started.
 - Anything stored inside the provisioned rootfs survives reconnects but is erased by reprovision.
 - The current design stores the root filesystem directly on the Fly volume without client-side disk encryption.
 
-That is why this skill stores task metadata in the provisioned rootfs and provides its own list/show/log/attach conventions on top of the console channel.
+That is why this skill stores task metadata in the provisioned rootfs, starts a localhost-only control service inside the VM, and uses local background `fly-vault --forward` processes for subsequent list/show/spawn/tmux control operations.
 
 ## Finding Remote VMs
 
@@ -114,6 +117,8 @@ python3 skills/remote-task/scripts/fly_vault_remote_task.py list --vault <vault>
 
 If an existing task already covers the work, reuse it instead of spawning a duplicate.
 
+The first helper invocation for a vault bootstraps the VM-side service and starts a local background tunnel. After that, normal interactions should go through the forwarded localhost port rather than through raw console scripting.
+
 ## Spawn Workflow
 
 1. Write a one-line `summary` that states what the task is doing.
@@ -122,6 +127,14 @@ If an existing task already covers the work, reuse it instead of spawning a dupl
 4. Provide the exact shell command to run.
 
 Always use `tmux`. This skill assumes remote tasks are reattachable interactive sessions, even when the command itself is mostly batch-like.
+
+Before real work on a new VM, run `doctor` once:
+
+```bash
+python3 skills/remote-task/scripts/fly_vault_remote_task.py doctor \
+  --vault my-dev \
+  --cwd /workspace/fly-vault
+```
 
 Example:
 
@@ -161,6 +174,30 @@ python3 skills/remote-task/scripts/fly_vault_remote_task.py logs --vault <vault>
 ```
 
 When resuming work in a later session, read `show` before touching the task. Re-state the stored `summary` and `why` in your own words so the user can see that you recovered the correct context.
+
+For non-interactive tmux control, use:
+
+```bash
+python3 skills/remote-task/scripts/fly_vault_remote_task.py send-keys \
+  --vault <vault> \
+  --task <task-id> \
+  --keys 'make test' \
+  --enter
+```
+
+```bash
+python3 skills/remote-task/scripts/fly_vault_remote_task.py capture-pane \
+  --vault <vault> \
+  --task <task-id>
+```
+
+If a task is stuck in `queued` or failed during startup after prerequisites were fixed, use:
+
+```bash
+python3 skills/remote-task/scripts/fly_vault_remote_task.py repair \
+  --vault <vault> \
+  --task <task-id>
+```
 
 ## Attach Rules
 
@@ -216,5 +253,6 @@ The helper intentionally stores:
 - timestamps
 - pid and pgid when available
 - combined log output
+- service metadata under `/var/lib/fly-vault/remote-task/.service`
 
-Do not start context-free background commands directly from a raw `fly-vault` shell. Use the helper so the next agent can discover what the task is for and reattach through tmux.
+Do not hand-roll tmux control over the raw console stream unless you are repairing the service itself. Use the helper so normal automation goes through the forwarded localhost control service.

@@ -1,18 +1,40 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import os
 import platform
 import re
 import shlex
+import signal
+import socket
 import subprocess
 import sys
 import textwrap
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 BEGIN_MARKER = "__FV_REMOTE_TASK_BEGIN__"
 END_MARKER = "__FV_REMOTE_TASK_END__"
 DEFAULT_TASK_ROOT = "/var/lib/fly-vault/remote-task"
+SERVICE_SESSION = "fv-remote-task-service"
+SERVICE_DIR_NAME = ".service"
+TUNNEL_WAIT_SECONDS = 8.0
+HEALTH_TIMEOUT_SECONDS = 1.5
+LIST_COLUMNS = [
+    "task_id",
+    "status",
+    "attachable",
+    "created_at",
+    "session_name",
+    "cwd",
+    "summary",
+    "why",
+    "startup_error",
+]
 
 
 def packaged_fly_vault_bin():
@@ -43,7 +65,7 @@ def default_fly_vault_bin():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Manage durable remote tasks over fly-vault."
+        description="Manage remote tasks over fly-vault through a VM-side control service."
     )
     parser.add_argument(
         "--fly-vault-bin",
@@ -55,10 +77,15 @@ def parse_args():
         default=DEFAULT_TASK_ROOT,
         help="Remote task registry root inside the provisioned rootfs.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured JSON instead of human-oriented text.",
+    )
 
     subparsers = parser.add_subparsers(dest="action", required=True)
 
-    spawn = subparsers.add_parser("spawn", help="Create a new remote task.")
+    spawn = subparsers.add_parser("spawn", help="Create a new tmux-backed remote task.")
     add_vault(spawn)
     spawn.add_argument("--summary", required=True, help="Short description of the task.")
     spawn.add_argument("--why", required=True, help="Reason this task was started.")
@@ -67,12 +94,7 @@ def parse_args():
         "--slug",
         help="Optional human-readable prefix for the task id. Defaults to the summary.",
     )
-    spawn.add_argument(
-        "--command",
-        dest="remote_command",
-        required=True,
-        help="Shell command to run remotely.",
-    )
+    spawn.add_argument("--command", required=True, help="Shell command to run remotely.")
 
     list_cmd = subparsers.add_parser("list", help="List known remote tasks.")
     add_vault(list_cmd)
@@ -86,13 +108,44 @@ def parse_args():
     logs.add_argument("--task", required=True, help="Task id.")
     logs.add_argument("--lines", type=int, default=200, help="Tail line count.")
     logs.add_argument("--follow", action="store_true", help="Follow the log stream.")
+    logs.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between log follow polls.",
+    )
 
     attach = subparsers.add_parser(
         "attach-snippet",
-        help="Print the snippet to paste into an interactive fly-vault shell.",
+        help="Print the tmux snippet to paste into an interactive fly-vault shell.",
     )
     add_vault(attach)
     attach.add_argument("--task", required=True, help="Task id.")
+
+    doctor = subparsers.add_parser("doctor", help="Check service and task prerequisites.")
+    add_vault(doctor)
+    doctor.add_argument("--cwd", default=".", help="Remote working directory to validate.")
+
+    repair = subparsers.add_parser("repair", help="Retry session creation for an existing task.")
+    add_vault(repair)
+    repair.add_argument("--task", required=True, help="Task id.")
+
+    send_keys = subparsers.add_parser(
+        "send-keys",
+        help="Send literal keys into a running tmux-backed task session.",
+    )
+    add_vault(send_keys)
+    send_keys.add_argument("--task", required=True, help="Task id.")
+    send_keys.add_argument("--keys", required=True, help="Literal text to send.")
+    send_keys.add_argument("--enter", action="store_true", help="Send Enter after the text.")
+
+    capture = subparsers.add_parser(
+        "capture-pane",
+        help="Capture recent pane output from a running tmux-backed task session.",
+    )
+    add_vault(capture)
+    capture.add_argument("--task", required=True, help="Task id.")
+    capture.add_argument("--lines", type=int, default=200, help="Captured line count.")
 
     return parser.parse_args()
 
@@ -114,279 +167,52 @@ def shell_heredoc(target_expr, body, label):
     return f"cat <<'{marker}' > {target_expr}\n{body}{marker}\n"
 
 
-def sanitize_slug(raw):
-    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
-    slug = re.sub(r"-{2,}", "-", slug)
-    return slug or "task"
+def cache_root():
+    base = Path.home() / ".cache" / "fly-vault" / "remote-task"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
-def remote_prelude(task_root):
-    return textwrap.dedent(
-        f"""\
-        set -eu
-        export PS1=
-        TASK_ROOT={shell_quote(task_root)}
-        BEGIN_MARKER={shell_quote(BEGIN_MARKER)}
-        END_MARKER={shell_quote(END_MARKER)}
-
-        fv_begin() {{
-          printf '%s\\n' "$BEGIN_MARKER"
-        }}
-
-        fv_end() {{
-          printf '%s\\n' "$END_MARKER"
-        }}
-
-        fv_now_iso() {{
-          date -u '+%Y-%m-%dT%H:%M:%SZ'
-        }}
-
-        fv_now_compact() {{
-          date -u '+%Y%m%dT%H%M%SZ'
-        }}
-
-        fv_first_line() {{
-          file="$1"
-          if [ -f "$file" ]; then
-            IFS= read -r line < "$file" || true
-            printf '%s' "$line"
-          fi
-        }}
-
-        fv_flat_file() {{
-          file="$1"
-          if [ -f "$file" ]; then
-            tr '\\n' ' ' < "$file" | tr '\\t' ' '
-          fi
-        }}
-
-        fv_require_task() {{
-          task_id="$1"
-          task_dir="$TASK_ROOT/$task_id"
-          if [ ! -d "$task_dir" ]; then
-            echo "task not found: $task_id" >&2
-            exit 1
-          fi
-        }}
-        """
-    )
+def tunnel_state_path(vault):
+    return cache_root() / f"{vault}.json"
 
 
-def build_runner_script():
-    return textwrap.dedent(
-        """\
-        #!/bin/sh
-        set -u
-
-        task_dir="$1"
-
-        fv_now_iso() {
-          date -u '+%Y-%m-%dT%H:%M:%SZ'
-        }
-
-        finish() {
-          rc=$?
-          printf '%s\\n' "$rc" > "$task_dir/exit_code.txt"
-          printf '%s\\n' "$(fv_now_iso)" > "$task_dir/finished_at.txt"
-          if [ "$rc" -eq 0 ]; then
-            printf '%s\\n' "succeeded" > "$task_dir/status.txt"
-          else
-            printf '%s\\n' "failed" > "$task_dir/status.txt"
-          fi
-          exit "$rc"
-        }
-
-        trap finish EXIT
-
-        printf '%s\\n' "$(fv_now_iso)" > "$task_dir/started_at.txt"
-        printf '%s\\n' "running" > "$task_dir/status.txt"
-        printf '%s\\n' "$$" > "$task_dir/pid.txt"
-        if command -v ps >/dev/null 2>&1; then
-          ps -o pgid= -p $$ | tr -d ' ' > "$task_dir/pgid.txt" 2>/dev/null || true
-        fi
-
-        IFS= read -r task_cwd < "$task_dir/meta/cwd.txt" || task_cwd=.
-        cd "$task_cwd"
-
-        "$task_dir/command.sh" >> "$task_dir/logs/combined.log" 2>&1
-        """
-    )
+def tunnel_log_path(vault):
+    return cache_root() / f"{vault}.log"
 
 
-def build_command_script(command_text):
-    return "#!/bin/sh\n" + command_text.rstrip("\n") + "\n"
-
-
-def wrap_remote_script(task_root, body, trailing_exit=True):
-    script = remote_prelude(task_root) + "\n" + body.rstrip() + "\n"
-    if trailing_exit:
-        script += "exit\n"
-    return script
-
-
-def build_spawn_script(args):
-    slug = sanitize_slug(args.slug or args.summary)
-    command_script = build_command_script(args.remote_command)
-    runner_script = build_runner_script()
-
-    body = textwrap.dedent(
-        f"""\
-        mkdir -p "$TASK_ROOT"
-        task_slug={shell_quote(slug)}
-        task_id="${{task_slug}}-$(fv_now_compact)-$$"
-        task_dir="$TASK_ROOT/$task_id"
-
-        mkdir -p "$task_dir/meta" "$task_dir/logs"
-        printf '%s\\n' "queued" > "$task_dir/status.txt"
-        printf '%s\\n' "$(fv_now_iso)" > "$task_dir/meta/created_at.txt"
-        printf '%s\\n' {shell_quote(args.cwd)} > "$task_dir/meta/cwd.txt"
-        printf '%s\\n' "tmux" > "$task_dir/meta/session_mode.txt"
-        """
-    )
-    body += shell_heredoc(
-        '"$task_dir/meta/summary.txt"',
-        args.summary,
-        "SUMMARY",
-    )
-    body += shell_heredoc(
-        '"$task_dir/meta/why.txt"',
-        args.why,
-        "WHY",
-    )
-    body += shell_heredoc(
-        '"$task_dir/command.sh"',
-        command_script,
-        "COMMAND",
-    )
-    body += shell_heredoc(
-        '"$task_dir/runner.sh"',
-        runner_script,
-        "RUNNER",
-    )
-    body += textwrap.dedent(
-        """\
-        chmod 700 "$task_dir/command.sh" "$task_dir/runner.sh"
-        """
-    )
-
-    body += textwrap.dedent(
-        f"""\
-        if ! command -v tmux >/dev/null 2>&1; then
-          echo "tmux is required for remote-task but is not installed" >&2
-          exit 1
-        fi
-        session_name="fv-${{task_id}}"
-        printf '%s\\n' "$session_name" > "$task_dir/meta/session_name.txt"
-        tmux new-session -d -s "$session_name" -c {shell_quote(args.cwd)} "$task_dir/runner.sh $task_dir"
-        """
-    )
-
-    body += textwrap.dedent(
-        """\
-        fv_begin
-        printf 'TASK_ID=%s\\n' "$task_id"
-        printf 'STATUS=%s\\n' "$(fv_first_line "$task_dir/status.txt")"
-        printf 'SESSION_MODE=%s\\n' "$(fv_first_line "$task_dir/meta/session_mode.txt")"
-        printf 'SESSION_NAME=%s\\n' "$(fv_first_line "$task_dir/meta/session_name.txt")"
-        printf 'TASK_DIR=%s\\n' "$task_dir"
-        printf 'CWD=%s\\n' "$(fv_first_line "$task_dir/meta/cwd.txt")"
-        printf 'LOG=%s\\n' "$task_dir/logs/combined.log"
-        fv_end
-        """
-    )
-    return wrap_remote_script(args.task_root, body)
-
-
-def build_list_script(args):
-    body = textwrap.dedent(
-        """\
-        fv_begin
-        printf 'TASK_ID\\tSTATUS\\tMODE\\tCREATED_AT\\tSESSION_NAME\\tCWD\\tSUMMARY\\tWHY\\n'
-        if [ -d "$TASK_ROOT" ]; then
-          for task_dir in "$TASK_ROOT"/*; do
-            [ -d "$task_dir" ] || continue
-            task_id=$(basename "$task_dir")
-            printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
-              "$task_id" \
-              "$(fv_first_line "$task_dir/status.txt")" \
-              "$(fv_first_line "$task_dir/meta/session_mode.txt")" \
-              "$(fv_first_line "$task_dir/meta/created_at.txt")" \
-              "$(fv_first_line "$task_dir/meta/session_name.txt")" \
-              "$(fv_flat_file "$task_dir/meta/cwd.txt")" \
-              "$(fv_flat_file "$task_dir/meta/summary.txt")" \
-              "$(fv_flat_file "$task_dir/meta/why.txt")"
-          done | LC_ALL=C sort
-        fi
-        fv_end
-        """
-    )
-    return wrap_remote_script(args.task_root, body)
-
-
-def build_show_script(task_root, task_id):
-    body = textwrap.dedent(
-        f"""\
-        fv_require_task {shell_quote(task_id)}
-        fv_begin
-        printf 'TASK_ID=%s\\n' {shell_quote(task_id)}
-        printf 'STATUS=%s\\n' "$(fv_first_line "$task_dir/status.txt")"
-        printf 'SESSION_MODE=%s\\n' "$(fv_first_line "$task_dir/meta/session_mode.txt")"
-        printf 'SESSION_NAME=%s\\n' "$(fv_first_line "$task_dir/meta/session_name.txt")"
-        printf 'TASK_DIR=%s\\n' "$task_dir"
-        printf 'CWD=%s\\n' "$(fv_first_line "$task_dir/meta/cwd.txt")"
-        printf 'CREATED_AT=%s\\n' "$(fv_first_line "$task_dir/meta/created_at.txt")"
-        printf 'STARTED_AT=%s\\n' "$(fv_first_line "$task_dir/started_at.txt")"
-        printf 'FINISHED_AT=%s\\n' "$(fv_first_line "$task_dir/finished_at.txt")"
-        printf 'EXIT_CODE=%s\\n' "$(fv_first_line "$task_dir/exit_code.txt")"
-        printf 'PID=%s\\n' "$(fv_first_line "$task_dir/pid.txt")"
-        printf 'PGID=%s\\n' "$(fv_first_line "$task_dir/pgid.txt")"
-        printf '%s\\n' '--SUMMARY--'
-        cat "$task_dir/meta/summary.txt"
-        printf '%s\\n' '--WHY--'
-        cat "$task_dir/meta/why.txt"
-        printf '%s\\n' '--COMMAND--'
-        cat "$task_dir/command.sh"
-        fv_end
-        """
-    )
-    return wrap_remote_script(task_root, body)
-
-
-def build_logs_script(args):
-    body = textwrap.dedent(
-        f"""\
-        fv_require_task {shell_quote(args.task)}
-        if [ ! -f "$task_dir/logs/combined.log" ]; then
-          : > "$task_dir/logs/combined.log"
-        fi
-        """
-    )
-    if args.follow:
-        body += textwrap.dedent(
-            f"""\
-            tail -n {args.lines} -f "$task_dir/logs/combined.log"
-            """
-        )
-        return wrap_remote_script(args.task_root, body, trailing_exit=False)
-
-    body += textwrap.dedent(
-        f"""\
-        fv_begin
-        tail -n {args.lines} "$task_dir/logs/combined.log"
-        fv_end
-        """
-    )
-    return wrap_remote_script(args.task_root, body)
+def service_script_path():
+    return Path(__file__).resolve().with_name("remote_task_service.py")
 
 
 def fly_vault_command(raw):
     cmd = shlex.split(raw)
     if not cmd:
-        raise ValueError("fly-vault command is empty")
+        raise SystemExit("fly-vault command is empty")
     return cmd
 
 
-def run_remote_capture(fly_vault_bin, vault, remote_script):
+def snippet(text, limit=40):
+    lines = text.splitlines()
+    if len(lines) > limit:
+        lines = lines[:limit] + ["..."]
+    return "\n".join(lines)
+
+
+def extract_marked_output(raw_output):
+    start = raw_output.find(BEGIN_MARKER)
+    if start == -1:
+        return None
+    start += len(BEGIN_MARKER)
+    if raw_output.startswith("\n", start):
+        start += 1
+    end = raw_output.find(END_MARKER, start)
+    if end == -1:
+        return None
+    return raw_output[start:end]
+
+
+def run_bootstrap_capture(fly_vault_bin, vault, remote_script):
     cmd = fly_vault_command(fly_vault_bin) + ["connect", vault]
     completed = subprocess.run(
         cmd,
@@ -394,113 +220,455 @@ def run_remote_capture(fly_vault_bin, vault, remote_script):
         text=True,
         capture_output=True,
     )
-
-    stdout = extract_marked_output(completed.stdout)
-    stderr = completed.stderr
-
-    if completed.returncode != 0:
-        if completed.stdout:
-            sys.stderr.write(completed.stdout)
-        if stderr:
-            sys.stderr.write(stderr)
-        raise SystemExit(completed.returncode)
-
-    return stdout
-
-
-def run_remote_passthrough(fly_vault_bin, vault, remote_script):
-    cmd = fly_vault_command(fly_vault_bin) + ["connect", vault]
-    completed = subprocess.run(cmd, input=remote_script, text=True)
-    raise SystemExit(completed.returncode)
+    payload = extract_marked_output(completed.stdout)
+    if payload is None:
+        raise SystemExit(
+            "remote-task bootstrap did not receive the expected payload markers.\n"
+            f"fly-vault exit code: {completed.returncode}\n"
+            f"stdout snippet:\n{snippet(completed.stdout)}\n"
+            f"stderr snippet:\n{snippet(completed.stderr)}\n"
+            "Hint: inspect raw `fly-vault connect` output or retry `doctor`."
+        )
+    return {
+        "returncode": completed.returncode,
+        "payload": payload,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
 
 
-def extract_marked_output(raw_output):
-    start = raw_output.find(BEGIN_MARKER)
-    if start == -1:
-        return raw_output
-    start += len(BEGIN_MARKER)
-    if raw_output.startswith("\n", start):
-        start += 1
-    end = raw_output.find(END_MARKER, start)
-    if end == -1:
-        return raw_output[start:]
-    return raw_output[start:end]
+def parse_bootstrap_payload(payload):
+    data = {}
+    for line in payload.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key] = value
+    return data
 
 
-def parse_fields(show_output):
-    fields = {}
-    summary_lines = []
-    why_lines = []
-    command_lines = []
-    section = "fields"
+def choose_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
-    for line in show_output.splitlines():
-        if line == "--SUMMARY--":
-            section = "summary"
-            continue
-        if line == "--WHY--":
-            section = "why"
-            continue
-        if line == "--COMMAND--":
-            section = "command"
-            continue
 
-        if section == "fields":
-            if "=" in line:
-                key, value = line.split("=", 1)
-                fields[key] = value
-        elif section == "summary":
-            summary_lines.append(line)
-        elif section == "why":
-            why_lines.append(line)
-        else:
-            command_lines.append(line)
+def process_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
-    fields["SUMMARY"] = "\n".join(summary_lines).rstrip("\n")
-    fields["WHY"] = "\n".join(why_lines).rstrip("\n")
-    fields["COMMAND"] = "\n".join(command_lines).rstrip("\n")
-    return fields
+
+def load_tunnel_state(vault):
+    path = tunnel_state_path(vault)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def save_tunnel_state(vault, state):
+    tunnel_state_path(vault).write_text(json.dumps(state, indent=2, sort_keys=True))
+
+
+def remove_tunnel_state(vault):
+    path = tunnel_state_path(vault)
+    if path.exists():
+        path.unlink()
+
+
+def stop_tunnel_process(state):
+    pid = state.get("pid")
+    if not process_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+
+
+def service_request(base_url, method, path, body=None, timeout=HEALTH_TIMEOUT_SECONDS):
+    url = base_url.rstrip("/") + path
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode())
+
+
+def service_health_ok(base_url):
+    try:
+        data = service_request(base_url, "GET", "/health")
+    except (urllib.error.URLError, TimeoutError, ValueError, ConnectionError):
+        return False
+    return bool(data.get("ok"))
+
+
+def ensure_local_tunnel(args, remote_port):
+    state = load_tunnel_state(args.vault)
+    if state and process_alive(state.get("pid")) and state.get("remote_port") == remote_port:
+        base_url = f"http://127.0.0.1:{state['local_port']}"
+        if service_health_ok(base_url):
+            return base_url
+        stop_tunnel_process(state)
+        remove_tunnel_state(args.vault)
+
+    local_port = choose_local_port()
+    cmd = fly_vault_command(args.fly_vault_bin) + [
+        "connect",
+        args.vault,
+        "--forward",
+        f"{local_port}:127.0.0.1:{remote_port}",
+    ]
+    log_path = tunnel_log_path(args.vault)
+    log_handle = open(log_path, "ab")
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    state = {
+        "pid": process.pid,
+        "local_port": local_port,
+        "remote_port": remote_port,
+        "log_path": str(log_path),
+    }
+    save_tunnel_state(args.vault, state)
+
+    base_url = f"http://127.0.0.1:{local_port}"
+    deadline = time.time() + TUNNEL_WAIT_SECONDS
+    while time.time() < deadline:
+        if service_health_ok(base_url):
+            return base_url
+        if process.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    log_excerpt = ""
+    if log_path.exists():
+        log_excerpt = snippet(log_path.read_text(errors="replace"))
+    raise SystemExit(
+        "remote-task tunnel did not become healthy.\n"
+        f"local port: {local_port}\n"
+        f"remote port: {remote_port}\n"
+        f"tunnel log snippet:\n{log_excerpt}"
+    )
+
+
+def build_bootstrap_script(task_root):
+    service_code = service_script_path().read_text()
+    service_dir = f"{task_root.rstrip('/')}/{SERVICE_DIR_NAME}"
+    service_file = f"{service_dir}/remote_task_service.py"
+    service_log = f"{service_dir}/service.log"
+    meta_dir = f"{service_dir}/meta"
+
+    body = textwrap.dedent(
+        f"""\
+        set -eu
+        export PS1=
+        TASK_ROOT={shell_quote(task_root)}
+        SERVICE_DIR={shell_quote(service_dir)}
+        SERVICE_FILE={shell_quote(service_file)}
+        SERVICE_LOG={shell_quote(service_log)}
+        META_DIR={shell_quote(meta_dir)}
+        SERVICE_SESSION={shell_quote(SERVICE_SESSION)}
+
+        fv_begin() {{
+          printf '%s\\n' {shell_quote(BEGIN_MARKER)}
+        }}
+
+        fv_end() {{
+          printf '%s\\n' {shell_quote(END_MARKER)}
+        }}
+
+        fv_fail() {{
+          msg="$1"
+          fv_begin
+          printf 'OK=0\\n'
+          printf 'ERROR=%s\\n' "$msg"
+          fv_end
+          exit 1
+        }}
+
+        if ! command -v python3 >/dev/null 2>&1; then
+          fv_fail "python3 is required for remote-task service"
+        fi
+        if ! command -v tmux >/dev/null 2>&1; then
+          fv_fail "tmux is required for remote-task service"
+        fi
+
+        mkdir -p "$TASK_ROOT" "$SERVICE_DIR" "$META_DIR"
+        """
+    )
+    body += shell_heredoc('"$SERVICE_FILE"', service_code, "SERVICE")
+    body += textwrap.dedent(
+        """\
+        chmod 700 "$SERVICE_FILE"
+
+        if tmux has-session -t "$SERVICE_SESSION" 2>/dev/null; then
+          tmux kill-session -t "$SERVICE_SESSION" || true
+        fi
+
+        rm -f "$META_DIR/service_port.txt"
+        tmux new-session -d -s "$SERVICE_SESSION" -c "$SERVICE_DIR" \
+          "python3 '$SERVICE_FILE' --task-root '$TASK_ROOT' --meta-dir '$META_DIR' >> '$SERVICE_LOG' 2>&1"
+
+        i=0
+        while [ $i -lt 80 ]; do
+          if [ -f "$META_DIR/service_port.txt" ]; then
+            port=$(cat "$META_DIR/service_port.txt")
+            fv_begin
+            printf 'OK=1\\n'
+            printf 'REMOTE_PORT=%s\\n' "$port"
+            printf 'SERVICE_SESSION=%s\\n' "$SERVICE_SESSION"
+            fv_end
+            exit 0
+          fi
+          i=$((i + 1))
+          sleep 0.1
+        done
+
+        log_tail=""
+        if [ -f "$SERVICE_LOG" ]; then
+          log_tail=$(tail -n 20 "$SERVICE_LOG" | tr '\\n' ' ' | tr '\\t' ' ')
+        fi
+        fv_begin
+        printf 'OK=0\\n'
+        printf 'ERROR=service failed to publish a port\\n'
+        printf 'LOG_TAIL=%s\\n' "$log_tail"
+        fv_end
+        exit 1
+        """
+    )
+    return body + "exit\n"
+
+
+def ensure_service(args):
+    state = load_tunnel_state(args.vault)
+    if state and process_alive(state.get("pid")):
+        base_url = f"http://127.0.0.1:{state['local_port']}"
+        if service_health_ok(base_url):
+            return base_url
+
+    bootstrap = run_bootstrap_capture(
+        args.fly_vault_bin,
+        args.vault,
+        build_bootstrap_script(args.task_root),
+    )
+    data = parse_bootstrap_payload(bootstrap["payload"])
+    if data.get("OK") != "1":
+        raise SystemExit(
+            "remote-task service bootstrap failed.\n"
+            f"reason: {data.get('ERROR', 'unknown error')}\n"
+            f"log tail: {data.get('LOG_TAIL', '')}"
+        )
+    return ensure_local_tunnel(args, int(data["REMOTE_PORT"]))
+
+
+def emit_json(data):
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def print_task_summary(record):
+    print(f"Task: {record['task_id']}")
+    print(f"Status: {record.get('status', '')}")
+    print(f"Attachable: {record.get('attachable', False)}")
+    print(f"Session: {record.get('session_name', '')}")
+    print(f"Cwd: {record.get('cwd', '')}")
+    print(f"Summary: {record.get('summary', '')}")
+    print(f"Why: {record.get('why', '')}")
+    if record.get("startup_error"):
+        print(f"Startup error: {record['startup_error']}")
+    print(f"Log: {record.get('log_path', '')}")
+    print(f"Attach: {record.get('attach_snippet', '')}")
 
 
 def do_spawn(args):
-    output = run_remote_capture(args.fly_vault_bin, args.vault, build_spawn_script(args))
-    sys.stdout.write(output)
+    base_url = ensure_service(args)
+    data = service_request(
+        base_url,
+        "POST",
+        "/spawn",
+        {
+            "summary": args.summary,
+            "why": args.why,
+            "cwd": args.cwd,
+            "slug": args.slug,
+            "command": args.command,
+        },
+    )
+    if args.json:
+        emit_json(data)
+    else:
+        if not data.get("ok"):
+            print(f"Spawn failed: {data.get('error', 'unknown error')}", file=sys.stderr)
+            if data.get("task"):
+                print_task_summary(data["task"])
+        else:
+            print_task_summary(data["task"])
+    raise SystemExit(0 if data.get("ok") else 1)
 
 
 def do_list(args):
-    output = run_remote_capture(args.fly_vault_bin, args.vault, build_list_script(args))
-    sys.stdout.write(output)
+    base_url = ensure_service(args)
+    data = service_request(base_url, "GET", "/tasks")
+    if args.json:
+        emit_json(data)
+        return
+    tasks = data.get("tasks", [])
+    if not tasks:
+        print("No tasks found.")
+        return
+    print("\t".join(LIST_COLUMNS))
+    for task in tasks:
+        row = []
+        for key in LIST_COLUMNS:
+            value = task.get(key, "")
+            if isinstance(value, bool):
+                value = "yes" if value else "no"
+            row.append(str(value).replace("\t", " ").replace("\n", " "))
+        print("\t".join(row))
 
 
 def do_show(args):
-    output = run_remote_capture(
-        args.fly_vault_bin,
-        args.vault,
-        build_show_script(args.task_root, args.task),
+    base_url = ensure_service(args)
+    data = service_request(
+        base_url,
+        "GET",
+        "/task?" + urllib.parse.urlencode({"task": args.task}),
     )
-    sys.stdout.write(output)
+    if args.json:
+        emit_json(data)
+        return
+    if not data.get("ok"):
+        raise SystemExit(data.get("error", "task lookup failed"))
+    task = data["task"]
+    print_task_summary(task)
+    print("-- command --")
+    print(task.get("command", ""))
 
 
 def do_logs(args):
-    remote_script = build_logs_script(args)
+    base_url = ensure_service(args)
     if args.follow:
-        run_remote_passthrough(args.fly_vault_bin, args.vault, remote_script)
-    output = run_remote_capture(args.fly_vault_bin, args.vault, remote_script)
-    sys.stdout.write(output)
+        offset = 0
+        while True:
+            data = service_request(
+                base_url,
+                "GET",
+                "/log-chunk?"
+                + urllib.parse.urlencode({"task": args.task, "offset": offset}),
+                timeout=max(HEALTH_TIMEOUT_SECONDS, args.poll_interval + 1.0),
+            )
+            if not data.get("ok"):
+                raise SystemExit(data.get("error", "failed to read log chunk"))
+            chunk = data.get("chunk", "")
+            if chunk:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            offset = data.get("next_offset", offset)
+            time.sleep(args.poll_interval)
+    data = service_request(
+        base_url,
+        "GET",
+        "/logs?" + urllib.parse.urlencode({"task": args.task, "lines": args.lines}),
+    )
+    if args.json:
+        emit_json(data)
+        return
+    if not data.get("ok"):
+        raise SystemExit(data.get("error", "failed to read logs"))
+    sys.stdout.write(data.get("log", ""))
 
 
 def do_attach_snippet(args):
-    show_output = run_remote_capture(
-        args.fly_vault_bin,
-        args.vault,
-        build_show_script(args.task_root, args.task),
+    base_url = ensure_service(args)
+    data = service_request(
+        base_url,
+        "GET",
+        "/attach-snippet?" + urllib.parse.urlencode({"task": args.task}),
     )
-    fields = parse_fields(show_output)
-    session_name = fields.get("SESSION_NAME", "")
-    if not session_name:
-        raise SystemExit("task is missing tmux session metadata")
+    if args.json:
+        emit_json(data)
+        return
+    if not data.get("ok"):
+        raise SystemExit(data.get("error", "failed to build attach snippet"))
+    print(data["attach_snippet"])
 
-    print(f"tmux attach -t {shell_quote(session_name)}")
+
+def do_doctor(args):
+    base_url = ensure_service(args)
+    data = service_request(
+        base_url,
+        "GET",
+        "/doctor?" + urllib.parse.urlencode({"cwd": args.cwd}),
+    )
+    if args.json:
+        emit_json(data)
+    else:
+        print(f"OK: {data.get('ok', False)}")
+        for key, value in data.get("checks", {}).items():
+            print(f"{key}: {value}")
+    raise SystemExit(0 if data.get("ok") else 1)
+
+
+def do_repair(args):
+    base_url = ensure_service(args)
+    data = service_request(
+        base_url,
+        "POST",
+        "/repair",
+        {"task": args.task},
+    )
+    if args.json:
+        emit_json(data)
+    else:
+        if not data.get("ok"):
+            print(f"Repair failed: {data.get('error', 'unknown error')}", file=sys.stderr)
+        if data.get("task"):
+            print_task_summary(data["task"])
+    raise SystemExit(0 if data.get("ok") else 1)
+
+
+def do_send_keys(args):
+    base_url = ensure_service(args)
+    data = service_request(
+        base_url,
+        "POST",
+        "/send-keys",
+        {"task": args.task, "keys": args.keys, "enter": args.enter},
+    )
+    if args.json:
+        emit_json(data)
+        return
+    if not data.get("ok"):
+        raise SystemExit(data.get("error", "failed to send keys"))
+    print(f"Sent keys to {args.task}")
+
+
+def do_capture_pane(args):
+    base_url = ensure_service(args)
+    data = service_request(
+        base_url,
+        "GET",
+        "/capture-pane?"
+        + urllib.parse.urlencode({"task": args.task, "lines": args.lines}),
+    )
+    if args.json:
+        emit_json(data)
+        return
+    if not data.get("ok"):
+        raise SystemExit(data.get("error", "failed to capture pane"))
+    sys.stdout.write(data.get("pane", ""))
 
 
 def main():
@@ -515,6 +683,14 @@ def main():
         do_logs(args)
     elif args.action == "attach-snippet":
         do_attach_snippet(args)
+    elif args.action == "doctor":
+        do_doctor(args)
+    elif args.action == "repair":
+        do_repair(args)
+    elif args.action == "send-keys":
+        do_send_keys(args)
+    elif args.action == "capture-pane":
+        do_capture_pane(args)
     else:
         raise SystemExit(f"unsupported command: {args.action}")
 

@@ -21,7 +21,7 @@ END_MARKER = "__FV_REMOTE_TASK_END__"
 DEFAULT_TASK_ROOT = "/var/lib/fly-vault/remote-task"
 SERVICE_SESSION = "fv-remote-task-service"
 SERVICE_DIR_NAME = ".service"
-HEALTH_TIMEOUT_SECONDS = 1.5
+HEALTH_TIMEOUT_SECONDS = 5.0
 DEFAULT_EXEC_TIMEOUT_SECONDS = 45.0
 DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS = 90.0
 DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 8.0
@@ -396,11 +396,11 @@ def build_service_request_script(task_root, method, path, body=None, timeout=HEA
         f"""\
         set -eu
         export PS1=
-        SERVICE_PORT_FILE={shell_quote(service_port_file)}
-        METHOD={shell_quote(method)}
-        PATH_INFO={shell_quote(path)}
-        BODY_JSON={shell_quote(body_json)}
-        REQUEST_TIMEOUT={shell_quote(str(timeout))}
+        export SERVICE_PORT_FILE={shell_quote(service_port_file)}
+        export METHOD={shell_quote(method)}
+        export PATH_INFO={shell_quote(path)}
+        export BODY_JSON={shell_quote(body_json)}
+        export REQUEST_TIMEOUT={shell_quote(str(timeout))}
 
         fv_begin() {{
           printf '%s\\n' {shell_quote(BEGIN_MARKER)}

@@ -115,11 +115,16 @@ async fn handle_connection(
             }
             STREAM_CONSOLE => {
                 let (root_dir, inner_pid) = {
-                    let guard = shared.lock().await;
-                    (
-                        guard.setup.root_mount_dir().to_path_buf(),
-                        guard.setup.inner_init_pid(),
-                    )
+                    let mut guard = shared.lock().await;
+                    let inner_pid = match guard.setup.ensure_live_inner_init_pid() {
+                        Ok(pid) => pid,
+                        Err(err) => {
+                            warn!(error = ?err, "console stream could not ensure live inner pid");
+                            let _ = send.reset(quinn::VarInt::from_u32(1));
+                            continue;
+                        }
+                    };
+                    (guard.setup.root_mount_dir().to_path_buf(), inner_pid)
                 };
                 tokio::spawn(async move {
                     if let Err(err) =
@@ -252,6 +257,20 @@ async fn handle_control_stream(
                         }
 
                         if rootfs_source.is_none() {
+                            {
+                                let mut guard = shared.lock().await;
+                                if let Err(err) = guard.setup.ensure_live_inner_init_pid() {
+                                    drop(guard);
+                                    send_error(
+                                        send,
+                                        format!(
+                                            "runtime unavailable after authentication: {err:#}"
+                                        ),
+                                    )
+                                    .await?;
+                                    return Ok(false);
+                                }
+                            }
                             ControlFrame::new(CONTROL_SETUP_COMPLETE, vec![])
                                 .write_to(send)
                                 .await?;

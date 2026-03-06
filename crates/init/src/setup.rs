@@ -1,14 +1,16 @@
 use anyhow::{anyhow, Context, Result};
+use nix::errno::Errno;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{clone, CloneFlags};
 use nix::sys::signal::{kill, Signal};
-use nix::sys::wait::waitpid;
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, execv, pivot_root, Pid};
 use protocol::VmState;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::task;
 use tracing::{info, warn};
 
@@ -24,13 +26,19 @@ pub struct SetupManager {
 
 #[derive(Debug)]
 struct RuntimeState {
-    _inner_init_pid: Option<Pid>,
+    inner_init_pid: Pid,
 }
 
 #[derive(Debug, Clone)]
 struct PersistentMount {
     source: PathBuf,
     target_relative: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LaunchMode {
+    SystemInitThenFallback,
+    FallbackOnly,
 }
 
 impl SetupManager {
@@ -65,8 +73,33 @@ impl SetupManager {
         &self.root_mount_dir
     }
 
-    pub fn inner_init_pid(&self) -> Option<Pid> {
-        self.runtime.as_ref().and_then(|r| r._inner_init_pid)
+    pub fn ensure_live_inner_init_pid(&mut self) -> Result<Pid> {
+        self.ensure_runtime_started()?;
+
+        if self.test_mode {
+            return self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.inner_init_pid)
+                .ok_or_else(|| anyhow!("test runtime missing after startup"));
+        }
+
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Err(anyhow!("runtime missing after startup"));
+        };
+
+        match poll_runtime(runtime.inner_init_pid)? {
+            RuntimePoll::Alive => Ok(runtime.inner_init_pid),
+            RuntimePoll::Exited(reason) => {
+                info!(
+                    pid = runtime.inner_init_pid.as_raw(),
+                    %reason,
+                    "inner pid 1 exited; starting fallback init in a fresh namespace"
+                );
+                self.runtime.take();
+                self.launch_runtime(LaunchMode::FallbackOnly)
+            }
+        }
     }
 
     pub fn runtime_started(&self) -> bool {
@@ -146,43 +179,26 @@ impl SetupManager {
         if self.test_mode {
             self.materialize_test_mode_persistent_links()?;
             self.runtime = Some(RuntimeState {
-                _inner_init_pid: None,
+                inner_init_pid: Pid::from_raw(std::process::id() as i32),
             });
             return Ok(());
         }
 
-        let inner_init_pid = {
-            let init_in_chroot = self.root_mount_dir.join(
-                self.init_binary
-                    .strip_prefix("/")
-                    .unwrap_or(&self.init_binary),
-            );
-            if !init_in_chroot.exists() {
-                warn!(
-                    path = %self.init_binary.display(),
-                    "init binary not found in rootfs, skipping inner init"
-                );
-                None
-            } else {
-                match launch_namespaced_init(
-                    &self.root_mount_dir,
-                    &self.init_binary,
-                    self.persistent_mounts.clone(),
-                ) {
-                    Ok(pid) => Some(pid),
-                    Err(err) => {
-                        warn!(error = ?err, "inner init launch failed, continuing without it");
-                        None
-                    }
-                }
-            }
-        };
-
-        self.runtime = Some(RuntimeState {
-            _inner_init_pid: inner_init_pid,
-        });
-
+        self.launch_runtime(LaunchMode::SystemInitThenFallback)?;
         Ok(())
+    }
+
+    fn launch_runtime(&mut self, launch_mode: LaunchMode) -> Result<Pid> {
+        let inner_init_pid = launch_namespaced_init(
+            &self.root_mount_dir,
+            &self.init_binary,
+            self.persistent_mounts.clone(),
+            launch_mode,
+        )
+        .with_context(|| format!("launch namespaced runtime in mode {:?}", launch_mode))?;
+
+        self.runtime = Some(RuntimeState { inner_init_pid });
+        Ok(inner_init_pid)
     }
 
     async fn stop_runtime(&mut self) -> Result<()> {
@@ -190,21 +206,24 @@ impl SetupManager {
             return Ok(());
         };
 
-        if let Some(pid) = runtime._inner_init_pid {
+        if self.test_mode {
+            return Ok(());
+        }
+
+        let pid = runtime.inner_init_pid;
+        info!(
+            pid = pid.as_raw(),
+            "reprovision/shutdown: sending SIGKILL to inner init"
+        );
+        let _ = kill(pid, Signal::SIGKILL);
+        let _ = task::spawn_blocking(move || {
+            let _ = waitpid(pid, None);
             info!(
                 pid = pid.as_raw(),
-                "reprovision/shutdown: sending SIGKILL to inner init"
+                "reprovision/shutdown: inner init reaped"
             );
-            let _ = kill(pid, Signal::SIGKILL);
-            let _ = task::spawn_blocking(move || {
-                let _ = waitpid(pid, None);
-                info!(
-                    pid = pid.as_raw(),
-                    "reprovision/shutdown: inner init reaped"
-                );
-            })
-            .await;
-        }
+        })
+        .await;
 
         Ok(())
     }
@@ -302,13 +321,14 @@ fn launch_namespaced_init(
     root: &Path,
     init_binary: &Path,
     persistent_mounts: Vec<PersistentMount>,
+    launch_mode: LaunchMode,
 ) -> Result<Pid> {
     let mut stack = vec![0u8; 1024 * 1024];
     let root = root.to_path_buf();
     let init_binary = init_binary.to_path_buf();
 
     let cb = Box::new(move || -> isize {
-        if let Err(err) = child_bootstrap(&root, &init_binary, &persistent_mounts) {
+        if let Err(err) = child_bootstrap(&root, &init_binary, &persistent_mounts, launch_mode) {
             eprintln!("child bootstrap failed: {err:#}");
             return 1;
         }
@@ -326,6 +346,7 @@ fn child_bootstrap(
     root: &Path,
     init_binary: &Path,
     persistent_mounts: &[PersistentMount],
+    launch_mode: LaunchMode,
 ) -> Result<()> {
     mount(
         None::<&str>,
@@ -362,6 +383,13 @@ fn child_bootstrap(
     umount2("/.old_root", MntFlags::MNT_DETACH).context("umount old root")?;
     let _ = fs::remove_dir("/.old_root");
 
+    match launch_mode {
+        LaunchMode::SystemInitThenFallback => exec_system_init_or_run_fallback(init_binary),
+        LaunchMode::FallbackOnly => run_fallback_init(None),
+    }
+}
+
+fn exec_system_init_or_run_fallback(init_binary: &Path) -> Result<()> {
     let init_c = CString::new(
         init_binary
             .to_str()
@@ -370,8 +398,73 @@ fn child_bootstrap(
     .context("init cstring")?;
     let args = [init_c.clone()];
 
-    execv(&init_c, &args).with_context(|| format!("exec {}", init_binary.display()))?;
-    Ok(())
+    match execv(&init_c, &args) {
+        Ok(_) => unreachable!("execv returned success without replacing process"),
+        Err(err) => {
+            warn!(
+                path = %init_binary.display(),
+                error = ?err,
+                "exec of /sbin/init failed; running fallback init as pid 1"
+            );
+            run_fallback_init(Some(format!(
+                "exec {} failed: {err}",
+                init_binary.display()
+            )))
+        }
+    }
+}
+
+fn run_fallback_init(reason: Option<String>) -> Result<()> {
+    if let Some(reason) = reason {
+        warn!(%reason, "fallback init active");
+    } else {
+        warn!("fallback init active");
+    }
+
+    loop {
+        match waitpid(None, None) {
+            Ok(WaitStatus::Exited(pid, status)) => {
+                info!(pid = pid.as_raw(), status, "fallback init reaped child");
+            }
+            Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                info!(
+                    pid = pid.as_raw(),
+                    ?signal,
+                    "fallback init reaped signaled child"
+                );
+            }
+            Ok(WaitStatus::Stopped(_, _))
+            | Ok(WaitStatus::PtraceEvent(_, _, _))
+            | Ok(WaitStatus::PtraceSyscall(_))
+            | Ok(WaitStatus::Continued(_)) => {}
+            Ok(WaitStatus::StillAlive) => {}
+            Err(Errno::ECHILD) => std::thread::sleep(Duration::from_millis(250)),
+            Err(err) => return Err(err).context("fallback init waitpid"),
+        }
+    }
+}
+
+enum RuntimePoll {
+    Alive,
+    Exited(String),
+}
+
+fn poll_runtime(pid: Pid) -> Result<RuntimePoll> {
+    match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => Ok(RuntimePoll::Alive),
+        Ok(WaitStatus::Exited(_, status)) => {
+            Ok(RuntimePoll::Exited(format!("exit status {status}")))
+        }
+        Ok(WaitStatus::Signaled(_, signal, _)) => {
+            Ok(RuntimePoll::Exited(format!("signal {signal}")))
+        }
+        Ok(WaitStatus::Stopped(_, _))
+        | Ok(WaitStatus::Continued(_))
+        | Ok(WaitStatus::PtraceEvent(_, _, _))
+        | Ok(WaitStatus::PtraceSyscall(_)) => Ok(RuntimePoll::Alive),
+        Err(Errno::ECHILD) => Ok(RuntimePoll::Exited("already reaped".to_string())),
+        Err(err) => Err(err).with_context(|| format!("poll inner pid {}", pid.as_raw())),
+    }
 }
 
 fn bind_persistent_mounts(root: &Path, persistent_mounts: &[PersistentMount]) -> Result<()> {

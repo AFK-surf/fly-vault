@@ -67,7 +67,7 @@ pub async fn handle_console_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     root_dir: &Path,
-    inner_pid: Option<Pid>,
+    inner_pid: Pid,
 ) -> Result<()> {
     let shell = if root_dir.join("bin/bash").exists() {
         "/bin/bash"
@@ -81,22 +81,16 @@ pub async fn handle_console_stream(
     // When an inner init is running in PID+mount namespaces, use nsenter to
     // join those namespaces so the console sees the same /proc and mounts.
     let slave_raw = slave_fd.as_raw_fd();
-    let mut cmd = if let Some(pid) = inner_pid {
-        let mut c = Command::new("nsenter");
-        c.args([
-            "-a",
-            "-t",
-            &pid.as_raw().to_string(),
-            &format!("--wd={}", root_dir.display()),
-            shell,
-            "-l",
-        ]);
-        c
-    } else {
-        let mut c = Command::new("chroot");
-        c.arg(root_dir).args([shell, "-l"]);
-        c
-    };
+    let mut cmd = Command::new("nsenter");
+    cmd.args([
+        "-m",
+        "-p",
+        "-t",
+        &inner_pid.as_raw().to_string(),
+        &format!("--wd={}", root_dir.display()),
+        shell,
+        "-l",
+    ]);
     unsafe {
         cmd.stdin(Stdio::from_raw_fd(dup_fd(slave_raw)?));
         cmd.stdout(Stdio::from_raw_fd(dup_fd(slave_raw)?));
@@ -111,13 +105,9 @@ pub async fn handle_console_stream(
             Ok(())
         });
     }
-    let mut child = cmd.spawn().with_context(|| {
-        if inner_pid.is_some() {
-            format!("spawn nsenter console {shell}")
-        } else {
-            format!("spawn chroot {} {shell}", root_dir.display())
-        }
-    })?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn nsenter console via pid {}", inner_pid.as_raw()))?;
 
     // Close slave in parent — the child has its own copies.
     drop(slave_fd);

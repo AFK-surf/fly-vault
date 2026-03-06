@@ -76,7 +76,8 @@ Control frames used by the provisioning/auth flow:
 - Detects state from `.provisioned`.
 - Extracts rootfs tarball into configured root mount dir (`/data/rootfs` by default).
 - Preserves `/root` and `/home` outside the extracted root and mounts them back into the VM root on boot.
-- Optionally launches inner init in PID+mount namespaces when running outside test mode.
+- Launches an inner PID+mount namespace on ready boot and reprovision.
+- Keeps `/sbin/init` as PID 1 when it execs successfully; if that exec fails or PID 1 later exits, `init` recreates the namespace and runs a minimal fallback init that only reaps child processes.
 
 ## 7. Configuration
 

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use nix::unistd::Pid;
 use protocol::{decode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXIT, CONSOLE_RESIZE};
+use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
@@ -121,49 +122,66 @@ pub async fn handle_console_stream(
     // Close slave in parent — the child has its own copies.
     drop(slave_fd);
 
-    // Prepare async I/O on the master side.
+    // Prepare async I/O on the master side. Keep the master in a narrow scope so
+    // any client/PTTY teardown drops it before we wait on the shell again.
     set_nonblocking(&master_fd)?;
-    let master = AsyncFd::new(master_fd).context("wrap pty master in AsyncFd")?;
+    let termination = {
+        let master = AsyncFd::new(master_fd).context("wrap pty master in AsyncFd")?;
 
-    let from_pty = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = pty_read(&master, &mut buf).await?;
-            if n == 0 {
-                break;
+        let from_pty = async {
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = pty_read(&master, &mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec())
+                    .write_to(&mut send)
+                    .await?;
             }
-            ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec())
-                .write_to(&mut send)
-                .await?;
-        }
-        Ok::<(), anyhow::Error>(())
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let to_pty = async {
+            loop {
+                let frame = match ConsoleFrame::read_from(&mut recv).await {
+                    Ok(frame) => frame,
+                    Err(err) if is_unexpected_eof(&err) => break,
+                    Err(err) => return Err(err),
+                };
+                match frame.ty {
+                    CONSOLE_DATA => {
+                        pty_write_all(&master, &frame.payload).await?;
+                    }
+                    CONSOLE_RESIZE => {
+                        let (rows, cols) = decode_resize(&frame.payload)?;
+                        set_pty_winsize(master.get_ref().as_raw_fd(), rows, cols);
+                    }
+                    _ => break,
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
+        wait_for_child_or_console_io(&mut child, from_pty, to_pty).await?
     };
 
-    let to_pty = async {
-        loop {
-            let frame = ConsoleFrame::read_from(&mut recv).await?;
-            match frame.ty {
-                CONSOLE_DATA => {
-                    pty_write_all(&master, &frame.payload).await?;
-                }
-                CONSOLE_RESIZE => {
-                    let (rows, cols) = decode_resize(&frame.payload)?;
-                    set_pty_winsize(master.get_ref().as_raw_fd(), rows, cols);
-                }
-                _ => break,
-            }
+    let status = match termination {
+        ConsoleTermination::Shell(status) => status,
+        ConsoleTermination::Pty(result) => {
+            let status = child.wait().await.context("wait on shell after pty EOF")?;
+            result?;
+            status
         }
-        Ok::<(), anyhow::Error>(())
+        ConsoleTermination::Client(result) => {
+            let status = child
+                .wait()
+                .await
+                .context("wait on shell after client disconnect")?;
+            result?;
+            status
+        }
     };
-
-    tokio::select! {
-        r = from_pty => { r?; }
-        r = to_pty => { r?; }
-    }
-
-    // Close the master so the child gets HUP, then reap it.
-    drop(master);
-    let status = child.wait().await.context("wait on shell")?;
     let code = status.code().unwrap_or(255) as u32;
     ConsoleFrame::new(CONSOLE_EXIT, code.to_be_bytes().to_vec())
         .write_to(&mut send)
@@ -229,7 +247,12 @@ async fn pty_read(master: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
                 )
             };
             if n < 0 {
-                Err(std::io::Error::last_os_error())
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EIO) {
+                    Ok(0)
+                } else {
+                    Err(err)
+                }
             } else {
                 Ok(n as usize)
             }
@@ -266,6 +289,39 @@ async fn pty_write_all(master: &AsyncFd<OwnedFd>, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+enum ConsoleTermination {
+    Shell(std::process::ExitStatus),
+    Pty(Result<()>),
+    Client(Result<()>),
+}
+
+async fn wait_for_child_or_console_io<FPty, FClient>(
+    child: &mut tokio::process::Child,
+    from_pty: FPty,
+    to_pty: FClient,
+) -> Result<ConsoleTermination>
+where
+    FPty: Future<Output = Result<()>>,
+    FClient: Future<Output = Result<()>>,
+{
+    tokio::pin!(from_pty);
+    tokio::pin!(to_pty);
+
+    tokio::select! {
+        status = child.wait() => Ok(ConsoleTermination::Shell(status.context("wait on shell")?)),
+        result = &mut from_pty => Ok(ConsoleTermination::Pty(result)),
+        result = &mut to_pty => Ok(ConsoleTermination::Client(result)),
+    }
+}
+
+fn is_unexpected_eof(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+    })
+}
+
 fn set_pty_winsize(fd: libc::c_int, rows: u16, cols: u16) {
     let ws = libc::winsize {
         ws_row: rows,
@@ -275,6 +331,57 @@ fn set_pty_winsize(fd: libc::c_int, rows: u16, cols: u16) {
     };
     unsafe {
         libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn pty_read_treats_hangup_as_eof() -> Result<()> {
+        let (master_fd, slave_fd) = open_pty()?;
+        drop(slave_fd);
+
+        set_nonblocking(&master_fd)?;
+        let master = AsyncFd::new(master_fd).context("wrap pty master")?;
+        let mut buf = [0u8; 16];
+
+        let n = timeout(Duration::from_secs(1), pty_read(&master, &mut buf))
+            .await
+            .context("timed out waiting for pty EOF")??;
+        assert_eq!(n, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_exit_wins_even_if_console_io_never_completes() -> Result<()> {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "(sleep 5) & exit 7"])
+            .spawn()
+            .context("spawn shell")?;
+
+        let termination = timeout(
+            Duration::from_secs(1),
+            wait_for_child_or_console_io(
+                &mut child,
+                std::future::pending::<Result<()>>(),
+                std::future::pending::<Result<()>>(),
+            ),
+        )
+        .await
+        .context("timed out waiting for child exit")??;
+
+        match termination {
+            ConsoleTermination::Shell(status) => assert_eq!(status.code(), Some(7)),
+            ConsoleTermination::Pty(_) | ConsoleTermination::Client(_) => {
+                panic!("expected shell exit to win")
+            }
+        }
+
+        Ok(())
     }
 }
 

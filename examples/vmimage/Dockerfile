@@ -10,6 +10,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # Install systemd + a minimal, practical base userland.
 # Includes the tools the remote-task skill expects:
 # - `tmux` for interactive reattachment
+# - `python3` for the VM-side remote-task control service
 # - `setsid` from util-linux for detached tasks
 # - `ps` from procps for pid/pgid capture
 RUN apt-get update && \
@@ -18,7 +19,7 @@ RUN apt-get update && \
       ca-certificates curl wget gnupg \
       iproute2 iputils-ping net-tools \
       openssh-server sudo \
-      vim-tiny less procps util-linux tmux kmod udev \
+      vim-tiny less procps util-linux tmux python3 kmod udev \
       locales tzdata && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 

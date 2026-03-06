@@ -4,8 +4,9 @@ use protocol::{
     STREAM_CONSOLE,
 };
 use std::io::IsTerminal;
-use std::os::fd::AsRawFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use tokio::io::unix::AsyncFd;
+use tokio::io::AsyncWriteExt;
 
 pub async fn run_console(conn: quinn::Connection) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("open console stream")?;
@@ -33,10 +34,10 @@ pub async fn run_console(conn: quinn::Connection) -> Result<()> {
     let stdin_task = {
         let tx = frame_tx.clone();
         async move {
-            let mut stdin = tokio::io::stdin();
+            let stdin = open_nonblocking_stdin().context("open nonblocking stdin")?;
             let mut buf = [0u8; 4096];
             loop {
-                let n = stdin.read(&mut buf).await.context("read local stdin")?;
+                let n = read_stdin(&stdin, &mut buf).await?;
                 if n == 0 {
                     break;
                 }
@@ -165,5 +166,54 @@ fn terminal_size() -> Option<(u16, u16)> {
         Some((ws.ws_row, ws.ws_col))
     } else {
         None
+    }
+}
+
+fn open_nonblocking_stdin() -> Result<AsyncFd<OwnedFd>> {
+    let fd = std::io::stdin().as_raw_fd();
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        return Err(std::io::Error::last_os_error()).context("dup stdin");
+    }
+
+    let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+    set_nonblocking(&owned)?;
+    AsyncFd::new(owned).context("wrap stdin in AsyncFd")
+}
+
+fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
+    let raw = fd.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error()).context("fcntl F_GETFL");
+        }
+        if libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error()).context("fcntl F_SETFL O_NONBLOCK");
+        }
+    }
+    Ok(())
+}
+
+async fn read_stdin(stdin: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
+    loop {
+        let mut guard = stdin.readable().await.context("wait for stdin readable")?;
+        match guard.try_io(|inner| {
+            let n = unsafe {
+                libc::read(
+                    inner.get_ref().as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        }) {
+            Ok(result) => return result.context("read local stdin"),
+            Err(_would_block) => continue,
+        }
     }
 }

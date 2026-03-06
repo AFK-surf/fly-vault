@@ -119,6 +119,8 @@ If an existing task already covers the work, reuse it instead of spawning a dupl
 
 The first helper invocation for a vault bootstraps the VM-side service with `fly-vault exec <vault> -- /bin/sh -lc ...`. After bootstrap, normal interactions should keep using the helper so task operations go through the service instead of ad hoc shell commands.
 
+The helper runs `fly-vault exec` through a local PTY instead of plain pipes. This avoids the `open nonblocking stdin` and `Operation not permitted (os error 1)` failures seen with raw piped invocations.
+
 ## Spawn Workflow
 
 1. Write a one-line `summary` that states what the task is doing.
@@ -135,6 +137,13 @@ python3 skills/remote-task/scripts/fly_vault_remote_task.py doctor \
   --vault my-dev \
   --cwd /workspace/fly-vault
 ```
+
+If bootstrap or later service calls are slow, the helper now emits periodic stderr progress and aborts with a bounded timeout instead of hanging indefinitely. Relevant knobs:
+
+- `--exec-timeout`: max seconds for a normal helper round-trip
+- `--bootstrap-timeout`: max seconds for service bootstrap
+- `--service-ready-timeout`: how long to poll `/health` after startup
+- `--progress-interval`: how often to print waiting updates on stderr
 
 Example:
 
@@ -221,7 +230,7 @@ fly-vault exec <vault> -- tmux attach -t <session-name>
 
 ## Helper Script Notes
 
-[scripts/fly_vault_remote_task.py](./scripts/fly_vault_remote_task.py) uses `fly-vault exec <vault> -- /bin/sh -lc ...` for bootstrap because it runs one remote shell command and exits cleanly after the bootstrap script completes.
+[scripts/fly_vault_remote_task.py](./scripts/fly_vault_remote_task.py) uses `fly-vault exec <vault> -- /bin/sh -lc ...` for bootstrap because it runs one remote shell command and exits cleanly after the bootstrap script completes. The local helper wraps that command in a PTY and polls service health after bootstrap instead of assuming a single immediate health check is authoritative.
 
 When the skill is packaged with embedded Linux binaries, the helper auto-selects the bundled `fly-vault` binary on Linux `amd64` and `arm64`. This is the expected execution path for the distributed skill.
 
@@ -255,4 +264,4 @@ The helper intentionally stores:
 - combined log output
 - service metadata under `/var/lib/fly-vault/remote-task/.service`
 
-Do not hand-roll tmux control over raw `fly-vault exec` sessions unless you are repairing the service itself. Use the helper so normal automation goes through the remote control service.
+Do not hand-roll tmux control over raw `fly-vault exec` sessions unless you are repairing the service itself or debugging a transport problem. Use the helper so normal automation goes through the remote control service with PTY transport, timeouts, and health-check retries.

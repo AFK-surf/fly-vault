@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import errno
 import json
 import os
 import platform
+import pty
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -19,6 +22,11 @@ DEFAULT_TASK_ROOT = "/var/lib/fly-vault/remote-task"
 SERVICE_SESSION = "fv-remote-task-service"
 SERVICE_DIR_NAME = ".service"
 HEALTH_TIMEOUT_SECONDS = 1.5
+DEFAULT_EXEC_TIMEOUT_SECONDS = 45.0
+DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS = 90.0
+DEFAULT_SERVICE_READY_TIMEOUT_SECONDS = 8.0
+DEFAULT_PROGRESS_INTERVAL_SECONDS = 10.0
+HEALTH_POLL_INTERVAL_SECONDS = 0.25
 LIST_COLUMNS = [
     "task_id",
     "status",
@@ -76,6 +84,30 @@ def parse_args():
         "--json",
         action="store_true",
         help="Print structured JSON instead of human-oriented text.",
+    )
+    parser.add_argument(
+        "--exec-timeout",
+        type=float,
+        default=DEFAULT_EXEC_TIMEOUT_SECONDS,
+        help="Seconds to wait for a normal fly-vault exec round-trip before aborting.",
+    )
+    parser.add_argument(
+        "--bootstrap-timeout",
+        type=float,
+        default=DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS,
+        help="Seconds to wait for service bootstrap fly-vault exec before aborting.",
+    )
+    parser.add_argument(
+        "--service-ready-timeout",
+        type=float,
+        default=DEFAULT_SERVICE_READY_TIMEOUT_SECONDS,
+        help="Seconds to poll for service health before giving up.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=DEFAULT_PROGRESS_INTERVAL_SECONDS,
+        help="Seconds between progress updates on stderr. Set to 0 to disable.",
     )
 
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -193,7 +225,108 @@ def extract_marked_output(raw_output):
     return raw_output[start:end]
 
 
-def run_remote_exec_capture(fly_vault_bin, vault, remote_script, purpose):
+def print_progress(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def format_elapsed(seconds):
+    return f"{seconds:.1f}s" if seconds < 10 else f"{seconds:.0f}s"
+
+
+def communicate_with_pty(cmd, purpose, timeout_seconds, progress_interval):
+    master_fd, slave_fd = pty.openpty()
+    start = time.monotonic()
+    next_progress_at = (
+        start + progress_interval if progress_interval and progress_interval > 0 else None
+    )
+    chunks = []
+    process = None
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+        )
+    finally:
+        os.close(slave_fd)
+
+    timed_out = False
+    try:
+        while True:
+            now = time.monotonic()
+            if timeout_seconds and timeout_seconds > 0 and now - start > timeout_seconds:
+                timed_out = True
+                process.terminate()
+                break
+
+            if next_progress_at is not None and now >= next_progress_at:
+                print_progress(
+                    f"remote-task: waiting for {purpose} via fly-vault exec "
+                    f"({format_elapsed(now - start)} elapsed)"
+                )
+                next_progress_at = now + progress_interval
+
+            if process.poll() is not None:
+                ready, _, _ = select.select([master_fd], [], [], 0)
+                if not ready:
+                    break
+                timeout = 0
+            else:
+                if timeout_seconds and timeout_seconds > 0:
+                    timeout = min(0.2, max(0.0, timeout_seconds - (now - start)))
+                else:
+                    timeout = 0.2
+            ready, _, _ = select.select([master_fd], [], [], timeout)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(master_fd)
+
+    if timed_out:
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        output = b"".join(chunks).decode(errors="replace")
+        raise SystemExit(
+            f"remote-task {purpose} timed out after {format_elapsed(timeout_seconds)}.\n"
+            "transport: fly-vault exec (pty)\n"
+            f"output snippet:\n{snippet(output)}\n"
+            "Hint: retry the command or inspect the remote service state with `doctor`."
+        )
+
+    returncode = process.wait()
+    output = b"".join(chunks).decode(errors="replace")
+    return {
+        "returncode": returncode,
+        "output": output,
+        "stdout": output,
+        "stderr": "",
+        "transport": "fly-vault exec (pty)",
+    }
+
+
+def run_remote_exec_capture(
+    fly_vault_bin,
+    vault,
+    remote_script,
+    purpose,
+    timeout_seconds=DEFAULT_EXEC_TIMEOUT_SECONDS,
+    progress_interval=DEFAULT_PROGRESS_INTERVAL_SECONDS,
+):
     cmd = fly_vault_command(fly_vault_bin) + [
         "exec",
         vault,
@@ -202,32 +335,46 @@ def run_remote_exec_capture(fly_vault_bin, vault, remote_script, purpose):
         "-lc",
         remote_script,
     ]
-    completed = subprocess.run(
+    completed = communicate_with_pty(
         cmd,
-        text=True,
-        capture_output=True,
+        purpose=purpose,
+        timeout_seconds=timeout_seconds,
+        progress_interval=progress_interval,
     )
-    payload = extract_marked_output(completed.stdout)
+    payload = extract_marked_output(completed["output"])
     if payload is None:
         raise SystemExit(
             f"remote-task {purpose} did not receive the expected payload markers.\n"
-            "transport: fly-vault exec\n"
-            f"fly-vault exit code: {completed.returncode}\n"
-            f"stdout snippet:\n{snippet(completed.stdout)}\n"
-            f"stderr snippet:\n{snippet(completed.stderr)}\n"
+            f"transport: {completed['transport']}\n"
+            f"fly-vault exit code: {completed['returncode']}\n"
+            f"output snippet:\n{snippet(completed['output'])}\n"
             "Hint: inspect raw fly-vault output or retry `doctor`."
         )
     return {
-        "returncode": completed.returncode,
+        "returncode": completed["returncode"],
         "payload": payload,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "transport": "fly-vault exec",
+        "stdout": completed["stdout"],
+        "stderr": completed["stderr"],
+        "output": completed["output"],
+        "transport": completed["transport"],
     }
 
 
-def run_bootstrap_capture(fly_vault_bin, vault, remote_script):
-    return run_remote_exec_capture(fly_vault_bin, vault, remote_script, "bootstrap")
+def run_bootstrap_capture(
+    fly_vault_bin,
+    vault,
+    remote_script,
+    timeout_seconds=DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS,
+    progress_interval=DEFAULT_PROGRESS_INTERVAL_SECONDS,
+):
+    return run_remote_exec_capture(
+        fly_vault_bin,
+        vault,
+        remote_script,
+        "bootstrap",
+        timeout_seconds=timeout_seconds,
+        progress_interval=progress_interval,
+    )
 
 
 def parse_bootstrap_payload(payload):
@@ -289,12 +436,21 @@ PY
     )
 
 
-def service_request(args, method, path, body=None, timeout=HEALTH_TIMEOUT_SECONDS):
+def service_request(
+    args,
+    method,
+    path,
+    body=None,
+    timeout=HEALTH_TIMEOUT_SECONDS,
+    exec_timeout=None,
+):
     completed = run_remote_exec_capture(
         args.fly_vault_bin,
         args.vault,
         build_service_request_script(args.task_root, method, path, body=body, timeout=timeout),
         "service request",
+        timeout_seconds=args.exec_timeout if exec_timeout is None else exec_timeout,
+        progress_interval=args.progress_interval,
     )
     try:
         return json.loads(completed["payload"])
@@ -302,12 +458,38 @@ def service_request(args, method, path, body=None, timeout=HEALTH_TIMEOUT_SECOND
         raise SystemExit(f"remote-task service returned invalid JSON: {exc}") from exc
 
 
-def service_health_ok(args):
+def service_health_ok(args, request_timeout=HEALTH_TIMEOUT_SECONDS, exec_timeout=None):
     try:
-        data = service_request(args, "GET", "/health")
-    except SystemExit:
-        return False
-    return bool(data.get("ok"))
+        data = service_request(
+            args,
+            "GET",
+            "/health",
+            timeout=request_timeout,
+            exec_timeout=exec_timeout,
+        )
+    except SystemExit as exc:
+        return False, str(exc)
+    return bool(data.get("ok")), ""
+
+
+def wait_for_service_health(args, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "health check did not return ok=true"
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        request_timeout = min(HEALTH_TIMEOUT_SECONDS, max(0.5, remaining))
+        exec_timeout = min(args.exec_timeout, request_timeout + 1.0)
+        ok, error = service_health_ok(
+            args,
+            request_timeout=request_timeout,
+            exec_timeout=exec_timeout,
+        )
+        if ok:
+            return ""
+        if error:
+            last_error = error
+        time.sleep(HEALTH_POLL_INTERVAL_SECONDS)
+    return last_error
 
 
 def build_bootstrap_script(task_root):
@@ -399,13 +581,23 @@ def build_bootstrap_script(task_root):
 
 
 def ensure_service(args):
-    if service_health_ok(args):
+    initial_health_error = wait_for_service_health(
+        args,
+        min(args.service_ready_timeout, 1.0),
+    )
+    if not initial_health_error:
         return
 
+    print_progress(
+        f"remote-task: bootstrapping service for vault {args.vault} "
+        f"after health check failed ({initial_health_error.splitlines()[0]})"
+    )
     bootstrap = run_bootstrap_capture(
         args.fly_vault_bin,
         args.vault,
         build_bootstrap_script(args.task_root),
+        timeout_seconds=args.bootstrap_timeout,
+        progress_interval=args.progress_interval,
     )
     data = parse_bootstrap_payload(bootstrap["payload"])
     if data.get("OK") != "1":
@@ -414,8 +606,14 @@ def ensure_service(args):
             f"reason: {data.get('ERROR', 'unknown error')}\n"
             f"log tail: {data.get('LOG_TAIL', '')}"
         )
-    if not service_health_ok(args):
-        raise SystemExit("remote-task service did not become healthy after bootstrap")
+    health_error = wait_for_service_health(args, args.service_ready_timeout)
+    if health_error:
+        port = data.get("REMOTE_PORT", "")
+        raise SystemExit(
+            "remote-task service did not become healthy after bootstrap.\n"
+            f"service port: {port or 'unknown'}\n"
+            f"last health error: {health_error}"
+        )
 
 
 def emit_json(data):

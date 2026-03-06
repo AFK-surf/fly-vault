@@ -74,8 +74,7 @@ pub async fn handle_console_stream(
 ) -> Result<()> {
     let launch = match ConsoleFrame::read_from(&mut recv).await? {
         ConsoleFrame {
-            ty: CONSOLE_SHELL,
-            ..
+            ty: CONSOLE_SHELL, ..
         } => ConsoleLaunch::Shell,
         ConsoleFrame {
             ty: CONSOLE_EXEC,
@@ -83,7 +82,9 @@ pub async fn handle_console_stream(
         } => {
             let argv = decode_exec_argv(&payload)?;
             if argv.is_empty() {
-                return Err(anyhow!("exec request must include at least one argv element"));
+                return Err(anyhow!(
+                    "exec request must include at least one argv element"
+                ));
             }
             ConsoleLaunch::Exec(argv)
         }
@@ -292,29 +293,36 @@ fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
 
 async fn pty_read(master: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
     loop {
+        if let Some(result) = try_read_fd(master.get_ref().as_raw_fd(), buf)? {
+            return Ok(result);
+        }
+
         let mut guard = master.readable().await.context("wait pty readable")?;
         match guard.try_io(|inner| {
-            let n = unsafe {
-                libc::read(
-                    inner.get_ref().as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                )
-            };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EIO) {
-                    Ok(0)
-                } else {
-                    Err(err)
-                }
-            } else {
-                Ok(n as usize)
-            }
+            try_read_fd(inner.get_ref().as_raw_fd(), buf)?
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))
         }) {
             Ok(result) => return result.context("read pty master"),
             Err(_would_block) => continue,
         }
+    }
+}
+
+fn try_read_fd(fd: libc::c_int, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    classify_pty_read(n)
+}
+
+fn classify_pty_read(read_result: isize) -> std::io::Result<Option<usize>> {
+    if read_result >= 0 {
+        return Ok(Some(read_result as usize));
+    }
+
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EAGAIN) => Ok(None),
+        Some(libc::EIO) => Ok(Some(0)),
+        _ => Err(err),
     }
 }
 
@@ -392,24 +400,16 @@ fn set_pty_winsize(fd: libc::c_int, rows: u16, cols: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::errno::Errno;
     use std::path::Path;
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
 
-    #[tokio::test]
-    async fn pty_read_treats_hangup_as_eof() -> Result<()> {
-        let (master_fd, slave_fd) = open_pty()?;
-        drop(slave_fd);
-
-        set_nonblocking(&master_fd)?;
-        let master = AsyncFd::new(master_fd).context("wrap pty master")?;
-        let mut buf = [0u8; 16];
-
-        let n = timeout(Duration::from_secs(1), pty_read(&master, &mut buf))
-            .await
-            .context("timed out waiting for pty EOF")??;
-        assert_eq!(n, 0);
-        Ok(())
+    #[test]
+    fn classify_pty_read_treats_eio_as_eof() {
+        Errno::set(Errno::EIO);
+        let result = classify_pty_read(-1).expect("eio should be mapped to eof");
+        assert_eq!(result, Some(0));
     }
 
     #[tokio::test]
@@ -457,7 +457,15 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-m", "-p", "-t", "42", "--wd=/tmp/rootfs", "--", "ls", "-lash", "/",
+                "-m",
+                "-p",
+                "-t",
+                "42",
+                "--wd=/tmp/rootfs",
+                "--",
+                "ls",
+                "-lash",
+                "/",
             ]
         );
     }

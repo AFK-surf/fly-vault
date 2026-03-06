@@ -71,10 +71,12 @@ pub async fn create_tenant(
         let created = match ensure_mount_volumes(client, &mut request, dry_run).await {
             Ok(created) => created,
             Err(error) => {
-                cleanup_created_volumes(client, &created_volume_ids).await;
-                return Err(error).with_context(|| {
-                    format!("prepare machine request for tenant '{}'", tenant_id)
-                });
+                let cleanup_errors = cleanup_created_volumes(client, &created_volume_ids).await;
+                return Err(with_cleanup_errors(
+                    error,
+                    cleanup_errors,
+                    format!("prepare machine request for tenant '{}'", tenant_id),
+                ));
             }
         };
         created_volume_ids.extend(created);
@@ -99,9 +101,13 @@ pub async fn create_tenant(
         {
             Ok(machine) => machine,
             Err(error) => {
-                cleanup_created_machines(client, &created_ids).await;
-                cleanup_created_volumes(client, &created_volume_ids).await;
-                return Err(error);
+                let mut cleanup_errors = cleanup_created_machines(client, &created_ids).await;
+                cleanup_errors.extend(cleanup_created_volumes(client, &created_volume_ids).await);
+                return Err(with_cleanup_errors(
+                    error,
+                    cleanup_errors,
+                    format!("create machine for tenant '{}'", tenant_id),
+                ));
             }
         };
         println!("created machine {}", machine.id);
@@ -114,9 +120,13 @@ pub async fn create_tenant(
             .await
             .with_context(|| format!("wait for machine {} to start", machine_id))
         {
-            cleanup_created_machines(client, &created_ids).await;
-            cleanup_created_volumes(client, &created_volume_ids).await;
-            return Err(error);
+            let mut cleanup_errors = cleanup_created_machines(client, &created_ids).await;
+            cleanup_errors.extend(cleanup_created_volumes(client, &created_volume_ids).await);
+            return Err(with_cleanup_errors(
+                error,
+                cleanup_errors,
+                format!("wait for tenant '{}' machines to start", tenant_id),
+            ));
         }
     }
 
@@ -128,16 +138,37 @@ pub async fn create_tenant(
     Ok(())
 }
 
-async fn cleanup_created_machines(client: &MachinesClient, machine_ids: &[String]) {
-    for machine_id in machine_ids {
-        let _ = client.delete_machine(machine_id, true).await;
+fn with_cleanup_errors(
+    error: anyhow::Error,
+    cleanup_errors: Vec<String>,
+    context: String,
+) -> anyhow::Error {
+    let error = error.context(context);
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        anyhow!("{}\ncleanup errors:\n{}", error, cleanup_errors.join("\n"))
     }
 }
 
-async fn cleanup_created_volumes(client: &MachinesClient, volume_ids: &[String]) {
-    for volume_id in volume_ids {
-        let _ = client.delete_volume(volume_id).await;
+async fn cleanup_created_machines(client: &MachinesClient, machine_ids: &[String]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for machine_id in machine_ids {
+        if let Err(err) = client.delete_machine(machine_id, true).await {
+            errors.push(format!("delete machine {}: {}", machine_id, err));
+        }
     }
+    errors
+}
+
+async fn cleanup_created_volumes(client: &MachinesClient, volume_ids: &[String]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for volume_id in volume_ids {
+        if let Err(err) = client.delete_volume(volume_id).await {
+            errors.push(format!("delete volume {}: {}", volume_id, err));
+        }
+    }
+    errors
 }
 
 async fn ensure_mount_volumes(
@@ -219,19 +250,30 @@ async fn ensure_mount_volumes(
             continue;
         }
 
+        let size_gb = mounts[mount.index]
+            .as_object()
+            .and_then(|mount_obj| mount_obj.get("size_gb"))
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or(Some(30));
+
         let volume = match client
             .create_volume(&CreateVolumeRequest {
                 name: mount.name.clone(),
                 region: Some(region.to_string()),
-                size_gb: Some(30),
+                size_gb,
             })
             .await
             .with_context(|| format!("create volume '{}' in region '{}'", mount.name, region))
         {
             Ok(volume) => volume,
             Err(error) => {
-                cleanup_created_volumes(client, &created_volume_ids).await;
-                return Err(error);
+                let cleanup_errors = cleanup_created_volumes(client, &created_volume_ids).await;
+                return Err(with_cleanup_errors(
+                    error,
+                    cleanup_errors,
+                    format!("create volume '{}' in region '{}'", mount.name, region),
+                ));
             }
         };
 

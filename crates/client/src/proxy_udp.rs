@@ -1,3 +1,4 @@
+use protocol::encode_proxy_machine_header;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use std::io;
@@ -21,8 +22,7 @@ impl ProxyUdpSocket {
                 "machine_id must not be empty",
             ));
         }
-
-        let machine_header = encode_machine_header(machine_id.as_bytes());
+        let machine_header = encode_proxy_machine_header(&machine_id).map_err(io::Error::other)?;
         Ok(Self {
             inner,
             machine_header,
@@ -87,13 +87,6 @@ impl AsyncUdpSocket for ProxyUdpSocket {
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
     }
-}
-
-pub fn encode_machine_header(machine_id: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + machine_id.len());
-    out.extend_from_slice(&(machine_id.len() as u64).to_le_bytes());
-    out.extend_from_slice(machine_id);
-    out
 }
 
 #[cfg(test)]
@@ -173,14 +166,14 @@ mod tests {
 
     #[test]
     fn encode_machine_header_uses_little_endian_len() {
-        let machine_id = b"machine-123";
-        let header = encode_machine_header(machine_id);
+        let machine_id = "machine-123";
+        let header = encode_proxy_machine_header(machine_id).unwrap();
 
         assert_eq!(
             &header[..8],
             (machine_id.len() as u64).to_le_bytes().as_slice()
         );
-        assert_eq!(&header[8..], machine_id);
+        assert_eq!(&header[8..], machine_id.as_bytes());
     }
 
     #[test]
@@ -202,7 +195,7 @@ mod tests {
         let sent = inner.take_sent();
         assert_eq!(sent.len(), 1);
 
-        let expected_header = encode_machine_header(b"machine-xyz");
+        let expected_header = encode_proxy_machine_header("machine-xyz").unwrap();
         assert_eq!(
             &sent[0][..expected_header.len()],
             expected_header.as_slice()

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+protocol = { path = "../protocol" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

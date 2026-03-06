@@ -5,20 +5,22 @@ use nix::sched::{clone, CloneFlags};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, execv, pivot_root, Pid};
-use protocol::VmState;
+use protocol::{RuntimeStatus, VmState};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio::task;
 use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct SetupManager {
     root_mount_dir: PathBuf,
+    staging_root_mount_dir: PathBuf,
+    previous_root_mount_dir: PathBuf,
     init_binary: PathBuf,
     provisioned_marker_file: PathBuf,
+    fallback_marker_file: PathBuf,
     persistent_mounts: Vec<PersistentMount>,
     test_mode: bool,
     runtime: Option<RuntimeState>,
@@ -35,12 +37,6 @@ struct PersistentMount {
     target_relative: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum LaunchMode {
-    SystemInitThenFallback,
-    FallbackOnly,
-}
-
 impl SetupManager {
     pub fn new(
         data_dir: PathBuf,
@@ -50,10 +46,14 @@ impl SetupManager {
     ) -> Result<Self> {
         let provisioned_marker_file = data_dir.join(".provisioned");
         let persistent_state_dir = data_dir.join("persist");
+        let fallback_marker_file = root_mount_dir.join(".fly-vault-fallback-init");
         Ok(Self {
+            staging_root_mount_dir: data_dir.join("rootfs.staging"),
+            previous_root_mount_dir: data_dir.join("rootfs.previous"),
             root_mount_dir,
             init_binary,
             provisioned_marker_file,
+            fallback_marker_file,
             persistent_mounts: vec![
                 PersistentMount {
                     source: persistent_state_dir.join("root"),
@@ -73,33 +73,40 @@ impl SetupManager {
         &self.root_mount_dir
     }
 
-    pub fn ensure_live_inner_init_pid(&mut self) -> Result<Pid> {
-        self.ensure_runtime_started()?;
-
+    pub fn runtime_status(&mut self) -> Result<RuntimeStatus> {
         if self.test_mode {
-            return self
-                .runtime
-                .as_ref()
-                .map(|runtime| runtime.inner_init_pid)
-                .ok_or_else(|| anyhow!("test runtime missing after startup"));
+            return Ok(if self.runtime.is_some() {
+                RuntimeStatus::SystemInit
+            } else {
+                RuntimeStatus::NotStarted
+            });
         }
 
         let Some(runtime) = self.runtime.as_ref() else {
-            return Err(anyhow!("runtime missing after startup"));
+            return Ok(RuntimeStatus::NotStarted);
         };
 
         match poll_runtime(runtime.inner_init_pid)? {
-            RuntimePoll::Alive => Ok(runtime.inner_init_pid),
+            RuntimePoll::Alive => Ok(if self.fallback_marker_file.exists() {
+                RuntimeStatus::FallbackInit
+            } else {
+                RuntimeStatus::SystemInit
+            }),
             RuntimePoll::Exited(reason) => {
-                info!(
-                    pid = runtime.inner_init_pid.as_raw(),
-                    %reason,
-                    "inner pid 1 exited; starting fallback init in a fresh namespace"
-                );
+                warn!(pid = runtime.inner_init_pid.as_raw(), %reason, "inner pid 1 exited");
                 self.runtime.take();
-                self.launch_runtime(LaunchMode::FallbackOnly)
+                self.clear_fallback_marker()?;
+                Ok(RuntimeStatus::NotStarted)
             }
         }
+    }
+
+    pub fn ensure_live_inner_init_pid(&mut self) -> Result<Pid> {
+        self.ensure_runtime_started()?;
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.inner_init_pid)
+            .ok_or_else(|| anyhow!("runtime missing after startup"))
     }
 
     pub fn runtime_started(&self) -> bool {
@@ -107,7 +114,7 @@ impl SetupManager {
     }
 
     pub fn detect_state(&self) -> Result<VmState> {
-        if self.runtime.is_some() || self.provisioned_marker_file.exists() {
+        if self.provisioned_marker_file.exists() {
             Ok(VmState::Ready)
         } else {
             Ok(VmState::Cold)
@@ -122,35 +129,17 @@ impl SetupManager {
     }
 
     pub async fn setup_and_prepare(&mut self, rootfs_tarball: Option<Vec<u8>>) -> Result<()> {
-        let was_cold = !self.provisioned_marker_file.exists();
+        let was_cold = self.detect_state()? == VmState::Cold;
         let is_provisioning = rootfs_tarball.is_some();
-        let is_reprovision = !was_cold && is_provisioning;
 
         if was_cold && !is_provisioning {
-            return Err(anyhow!("cold boot requires ProvisionRootfs payload"));
-        }
-
-        if is_reprovision {
-            self.stop_runtime().await?;
-            self.clear_provision_marker()?;
-        }
-
-        if self.test_mode {
-            if is_provisioning {
-                self.reset_root_mount_dir()?;
-                extract_rootfs_if_present(&self.root_mount_dir, rootfs_tarball.as_deref())?;
-                self.prepare_persistent_layout()?;
-                self.store_provision_marker()?;
-            }
-            self.ensure_runtime_started()?;
-            return Ok(());
+            return Err(anyhow!("cold boot requires a rootfs payload"));
         }
 
         if let Some(data) = rootfs_tarball {
-            self.reset_root_mount_dir()?;
-            extract_rootfs(&self.root_mount_dir, &data)?;
-            self.prepare_persistent_layout()?;
-            self.store_provision_marker()?;
+            self.stage_rootfs(&data)?;
+            self.activate_staged_root().await?;
+            return Ok(());
         }
 
         self.ensure_runtime_started()
@@ -162,46 +151,124 @@ impl SetupManager {
             return;
         }
         let _ = self.stop_runtime().await;
-
         info!("shutdown: complete");
     }
 
-    fn store_provision_marker(&self) -> Result<()> {
-        fs::write(&self.provisioned_marker_file, b"1")
-            .with_context(|| format!("write {}", self.provisioned_marker_file.display()))
-    }
-
     fn ensure_runtime_started(&mut self) -> Result<()> {
-        if self.runtime.is_some() {
-            return Ok(());
-        }
-
         if self.test_mode {
-            self.materialize_test_mode_persistent_links()?;
+            self.materialize_test_mode_persistent_links(&self.root_mount_dir)?;
             self.runtime = Some(RuntimeState {
                 inner_init_pid: Pid::from_raw(std::process::id() as i32),
             });
             return Ok(());
         }
 
-        self.launch_runtime(LaunchMode::SystemInitThenFallback)?;
-        Ok(())
-    }
+        if let Some(runtime) = self.runtime.as_ref() {
+            match poll_runtime(runtime.inner_init_pid)? {
+                RuntimePoll::Alive => return Ok(()),
+                RuntimePoll::Exited(reason) => {
+                    warn!(
+                        pid = runtime.inner_init_pid.as_raw(),
+                        %reason,
+                        "inner pid 1 exited; relaunching runtime"
+                    );
+                    self.runtime.take();
+                }
+            }
+        }
 
-    fn launch_runtime(&mut self, launch_mode: LaunchMode) -> Result<Pid> {
+        self.clear_fallback_marker()?;
         let inner_init_pid = launch_namespaced_init(
             &self.root_mount_dir,
             &self.init_binary,
+            &self.fallback_marker_file,
             self.persistent_mounts.clone(),
-            launch_mode,
         )
-        .with_context(|| format!("launch namespaced runtime in mode {:?}", launch_mode))?;
+        .context("launch namespaced runtime")?;
 
         self.runtime = Some(RuntimeState { inner_init_pid });
-        Ok(inner_init_pid)
+        Ok(())
     }
 
-    async fn stop_runtime(&mut self) -> Result<()> {
+    fn stage_rootfs(&self, data: &[u8]) -> Result<()> {
+        reset_dir(&self.staging_root_mount_dir)?;
+        extract_rootfs(&self.staging_root_mount_dir, data)?;
+        self.prepare_persistent_layout(&self.staging_root_mount_dir)?;
+        Ok(())
+    }
+
+    async fn activate_staged_root(&mut self) -> Result<()> {
+        let had_existing_root =
+            self.provisioned_marker_file.exists() || self.root_mount_dir.exists();
+
+        self.stop_runtime().await?;
+        remove_path_if_exists(&self.previous_root_mount_dir)?;
+
+        if had_existing_root && self.root_mount_dir.exists() {
+            fs::rename(&self.root_mount_dir, &self.previous_root_mount_dir).with_context(|| {
+                format!(
+                    "rename {} -> {}",
+                    self.root_mount_dir.display(),
+                    self.previous_root_mount_dir.display()
+                )
+            })?;
+        }
+
+        if let Err(err) = fs::rename(&self.staging_root_mount_dir, &self.root_mount_dir)
+            .with_context(|| {
+                format!(
+                    "rename {} -> {}",
+                    self.staging_root_mount_dir.display(),
+                    self.root_mount_dir.display()
+                )
+            })
+        {
+            self.restore_previous_root(had_existing_root)?;
+            return Err(err);
+        }
+
+        self.store_provision_marker()?;
+
+        match self.ensure_runtime_started() {
+            Ok(()) => {
+                remove_path_if_exists(&self.previous_root_mount_dir)?;
+                Ok(())
+            }
+            Err(err) => {
+                let restore_err = self.restore_previous_root(had_existing_root);
+                if had_existing_root {
+                    let _ = self.ensure_runtime_started();
+                }
+
+                match restore_err {
+                    Ok(()) => Err(err).context("start new runtime after rootfs activation"),
+                    Err(restore_err) => Err(err)
+                        .context("start new runtime after rootfs activation")
+                        .context(format!("restore previous rootfs failed: {restore_err:#}")),
+                }
+            }
+        }
+    }
+
+    fn restore_previous_root(&self, had_existing_root: bool) -> Result<()> {
+        remove_path_if_exists(&self.root_mount_dir)?;
+        if had_existing_root && self.previous_root_mount_dir.exists() {
+            fs::rename(&self.previous_root_mount_dir, &self.root_mount_dir).with_context(|| {
+                format!(
+                    "restore {} -> {}",
+                    self.previous_root_mount_dir.display(),
+                    self.root_mount_dir.display()
+                )
+            })?;
+            self.store_provision_marker()?;
+        } else {
+            self.clear_provision_marker()?;
+        }
+        remove_path_if_exists(&self.staging_root_mount_dir)?;
+        Ok(())
+    }
+
+    pub async fn stop_runtime(&mut self) -> Result<()> {
         let Some(runtime) = self.runtime.take() else {
             return Ok(());
         };
@@ -224,8 +291,13 @@ impl SetupManager {
             );
         })
         .await;
-
+        self.clear_fallback_marker()?;
         Ok(())
+    }
+
+    fn store_provision_marker(&self) -> Result<()> {
+        fs::write(&self.provisioned_marker_file, b"1")
+            .with_context(|| format!("write {}", self.provisioned_marker_file.display()))
     }
 
     fn clear_provision_marker(&self) -> Result<()> {
@@ -237,18 +309,19 @@ impl SetupManager {
         }
     }
 
-    fn reset_root_mount_dir(&self) -> Result<()> {
-        if self.root_mount_dir.exists() {
-            fs::remove_dir_all(&self.root_mount_dir)
-                .with_context(|| format!("remove {}", self.root_mount_dir.display()))?;
+    fn clear_fallback_marker(&self) -> Result<()> {
+        match fs::remove_file(&self.fallback_marker_file) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => {
+                Err(err).with_context(|| format!("remove {}", self.fallback_marker_file.display()))
+            }
         }
-        fs::create_dir_all(&self.root_mount_dir)
-            .with_context(|| format!("create {}", self.root_mount_dir.display()))
     }
 
-    fn prepare_persistent_layout(&self) -> Result<()> {
+    fn prepare_persistent_layout(&self, root: &Path) -> Result<()> {
         for persistent_mount in &self.persistent_mounts {
-            let target = self.root_mount_dir.join(&persistent_mount.target_relative);
+            let target = root.join(&persistent_mount.target_relative);
             self.ensure_persistent_source_dir(persistent_mount, &target)?;
 
             if self.test_mode {
@@ -291,9 +364,9 @@ impl SetupManager {
         ensure_directory(&persistent_mount.source)
     }
 
-    fn materialize_test_mode_persistent_links(&self) -> Result<()> {
+    fn materialize_test_mode_persistent_links(&self, root: &Path) -> Result<()> {
         for persistent_mount in &self.persistent_mounts {
-            let target = self.root_mount_dir.join(&persistent_mount.target_relative);
+            let target = root.join(&persistent_mount.target_relative);
             self.ensure_persistent_source_dir(persistent_mount, &target)?;
             replace_with_symlink(&persistent_mount.source, &target)?;
         }
@@ -310,25 +383,27 @@ fn extract_rootfs(target_root: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn extract_rootfs_if_present(target_root: &Path, data: Option<&[u8]>) -> Result<()> {
-    if let Some(data) = data {
-        extract_rootfs(target_root, data)?;
-    }
-    Ok(())
-}
-
 fn launch_namespaced_init(
     root: &Path,
     init_binary: &Path,
+    fallback_marker_file: &Path,
     persistent_mounts: Vec<PersistentMount>,
-    launch_mode: LaunchMode,
 ) -> Result<Pid> {
     let mut stack = vec![0u8; 1024 * 1024];
     let root = root.to_path_buf();
     let init_binary = init_binary.to_path_buf();
+    let fallback_marker_file = fallback_marker_file
+        .file_name()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("fallback marker file must have file name"))?;
 
     let cb = Box::new(move || -> isize {
-        if let Err(err) = child_bootstrap(&root, &init_binary, &persistent_mounts, launch_mode) {
+        if let Err(err) = child_bootstrap(
+            &root,
+            &init_binary,
+            &fallback_marker_file,
+            &persistent_mounts,
+        ) {
             eprintln!("child bootstrap failed: {err:#}");
             return 1;
         }
@@ -345,8 +420,8 @@ fn launch_namespaced_init(
 fn child_bootstrap(
     root: &Path,
     init_binary: &Path,
+    fallback_marker_file: &Path,
     persistent_mounts: &[PersistentMount],
-    launch_mode: LaunchMode,
 ) -> Result<()> {
     mount(
         None::<&str>,
@@ -357,8 +432,6 @@ fn child_bootstrap(
     )
     .context("set mount propagation private")?;
 
-    // pivot_root requires the new root to be a mount point. Since /data/rootfs
-    // is now a plain directory on the data volume, bind-mount it onto itself first.
     mount(
         Some(root),
         root,
@@ -383,13 +456,11 @@ fn child_bootstrap(
     umount2("/.old_root", MntFlags::MNT_DETACH).context("umount old root")?;
     let _ = fs::remove_dir("/.old_root");
 
-    match launch_mode {
-        LaunchMode::SystemInitThenFallback => exec_system_init_or_run_fallback(init_binary),
-        LaunchMode::FallbackOnly => run_fallback_init(None),
-    }
+    let fallback_marker = Path::new("/").join(fallback_marker_file);
+    exec_system_init_or_run_fallback(init_binary, &fallback_marker)
 }
 
-fn exec_system_init_or_run_fallback(init_binary: &Path) -> Result<()> {
+fn exec_system_init_or_run_fallback(init_binary: &Path, fallback_marker_file: &Path) -> Result<()> {
     let init_c = CString::new(
         init_binary
             .to_str()
@@ -404,17 +475,20 @@ fn exec_system_init_or_run_fallback(init_binary: &Path) -> Result<()> {
             warn!(
                 path = %init_binary.display(),
                 error = ?err,
-                "exec of /sbin/init failed; running fallback init as pid 1"
+                "exec of init failed; running fallback init as pid 1"
             );
-            run_fallback_init(Some(format!(
-                "exec {} failed: {err}",
-                init_binary.display()
-            )))
+            run_fallback_init(
+                Some(format!("exec {} failed: {err}", init_binary.display())),
+                fallback_marker_file,
+            )
         }
     }
 }
 
-fn run_fallback_init(reason: Option<String>) -> Result<()> {
+fn run_fallback_init(reason: Option<String>, fallback_marker_file: &Path) -> Result<()> {
+    fs::write(fallback_marker_file, b"1")
+        .with_context(|| format!("write {}", fallback_marker_file.display()))?;
+
     if let Some(reason) = reason {
         warn!(%reason, "fallback init active");
     } else {
@@ -436,9 +510,9 @@ fn run_fallback_init(reason: Option<String>) -> Result<()> {
             Ok(WaitStatus::Stopped(_, _))
             | Ok(WaitStatus::PtraceEvent(_, _, _))
             | Ok(WaitStatus::PtraceSyscall(_))
-            | Ok(WaitStatus::Continued(_)) => {}
-            Ok(WaitStatus::StillAlive) => {}
-            Err(Errno::ECHILD) => std::thread::sleep(Duration::from_millis(250)),
+            | Ok(WaitStatus::Continued(_))
+            | Ok(WaitStatus::StillAlive) => {}
+            Err(Errno::ECHILD) => std::thread::sleep(std::time::Duration::from_millis(250)),
             Err(err) => return Err(err).context("fallback init waitpid"),
         }
     }
@@ -504,6 +578,22 @@ fn ensure_directory(path: &Path) -> Result<()> {
     }
 
     fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
+}
+
+fn reset_dir(path: &Path) -> Result<()> {
+    remove_path_if_exists(path)?;
+    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))
+        }
+        Ok(_) => fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+    }
 }
 
 fn replace_with_symlink(source: &Path, target: &Path) -> Result<()> {

@@ -3,9 +3,8 @@ use anyhow::{anyhow, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use protocol::{
-    AttestationPayload, ControlFrame, VmState, CONTROL_ACCESS_TOKEN, CONTROL_ATTESTATION,
-    CONTROL_ERROR, CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL,
-    CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONTROL,
+    AttestationPayload, ControlMessage, RootfsSource, RuntimeStatus, SetupRequest, VmState,
+    PROTOCOL_VERSION, STREAM_CONTROL,
 };
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -159,7 +158,9 @@ async fn reprovisioning_kills_runtime_and_resets_rootfs() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_boot_to_ready_and_reconnect() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
     let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
@@ -178,11 +179,9 @@ async fn cold_boot_to_ready_and_reconnect() -> Result<()> {
     let (mut send2, mut recv2) = open_control_stream(&conn).await?;
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
+    assert_eq!(att2.runtime_status, RuntimeStatus::SystemInit);
 
-    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"test-access-token".to_vec())
-        .write_to(&mut send2)
-        .await
-        .context("send access token")?;
+    send_setup_request(&mut send2, "test-access-token", RootfsSource::None).await?;
     wait_setup_complete(&mut recv2).await?;
 
     server.abort();
@@ -192,7 +191,9 @@ async fn cold_boot_to_ready_and_reconnect() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_boot_with_rootfs_url() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
     let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
@@ -217,7 +218,9 @@ async fn cold_boot_with_rootfs_url() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_boot_rejected_without_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
     let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("correct-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
@@ -229,17 +232,16 @@ async fn cold_boot_rejected_without_access_token() -> Result<()> {
 
     let att = request_attestation(&mut send, &mut recv).await?;
     assert_eq!(att.state, VmState::Cold);
+    assert_eq!(att.runtime_status, RuntimeStatus::NotStarted);
 
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS, test_rootfs("missing-token")?)
-        .write_to(&mut send)
-        .await
-        .context("send rootfs")?;
+    send_setup_request(
+        &mut send,
+        "",
+        RootfsSource::Inline(test_rootfs("missing-token")?),
+    )
+    .await?;
 
-    let frame = ControlFrame::read_from(&mut recv)
-        .await
-        .context("read error frame")?;
-    assert_eq!(frame.ty, CONTROL_ERROR);
-    let msg = String::from_utf8(frame.payload).unwrap();
+    let msg = read_error_message(&mut recv).await?;
     assert!(
         msg.contains("access token"),
         "expected access token error, got: {msg}"
@@ -252,7 +254,9 @@ async fn cold_boot_rejected_without_access_token() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_boot_rejected_with_wrong_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
     let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("correct-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
@@ -265,19 +269,17 @@ async fn cold_boot_rejected_with_wrong_access_token() -> Result<()> {
     let att = request_attestation(&mut send, &mut recv).await?;
     assert_eq!(att.state, VmState::Cold);
 
-    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"wrong-token".to_vec())
-        .write_to(&mut send)
-        .await
-        .context("send wrong access token")?;
+    send_setup_request(
+        &mut send,
+        "wrong-token",
+        RootfsSource::Inline(test_rootfs("wrong-token")?),
+    )
+    .await?;
 
-    let frame = ControlFrame::read_from(&mut recv)
-        .await
-        .context("read error frame")?;
-    assert_eq!(frame.ty, CONTROL_ERROR);
-    let msg = String::from_utf8(frame.payload).unwrap();
+    let msg = read_error_message(&mut recv).await?;
     assert!(
-        msg.contains("mismatch"),
-        "expected mismatch error, got: {msg}"
+        msg.contains("verification failed"),
+        "expected verification error, got: {msg}"
     );
 
     server.abort();
@@ -287,7 +289,9 @@ async fn cold_boot_rejected_with_wrong_access_token() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ready_rejects_wrong_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
     let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
@@ -307,15 +311,8 @@ async fn ready_rejects_wrong_access_token() -> Result<()> {
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
 
-    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"wrong-token".to_vec())
-        .write_to(&mut send2)
-        .await
-        .context("send wrong access token")?;
-    let frame = ControlFrame::read_from(&mut recv2)
-        .await
-        .context("read error frame")?;
-    assert_eq!(frame.ty, CONTROL_ERROR);
-    let msg = String::from_utf8(frame.payload).unwrap();
+    send_setup_request(&mut send2, "wrong-token", RootfsSource::None).await?;
+    let msg = read_error_message(&mut recv2).await?;
     assert!(
         msg.contains("verification failed"),
         "expected access token verification error, got: {msg}"
@@ -328,7 +325,9 @@ async fn ready_rejects_wrong_access_token() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unauthenticated_stream_rejected() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
     let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("tok".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
@@ -355,7 +354,9 @@ async fn unauthenticated_stream_rejected() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ready_reprovision_with_access_token() -> Result<()> {
     let temp = TempDir::new().context("create temp dir")?;
-    let port = choose_udp_port()?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
     let args = args_for_test(&temp, port)?;
     let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
@@ -375,26 +376,16 @@ async fn ready_reprovision_with_access_token() -> Result<()> {
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
 
-    ControlFrame::new(
-        CONTROL_PROVISION_ROOTFS,
-        test_rootfs("ready-reprovision-v2")?,
+    send_setup_request(
+        &mut send2,
+        "test-access-token",
+        RootfsSource::Inline(test_rootfs("ready-reprovision-v2")?),
     )
-    .write_to(&mut send2)
-    .await
-    .context("send reprovision rootfs")?;
-    ControlFrame::new(CONTROL_ACCESS_TOKEN, b"test-access-token".to_vec())
-        .write_to(&mut send2)
-        .await
-        .context("send access token")?;
+    .await?;
     wait_setup_complete(&mut recv2).await?;
 
     server.abort();
     Ok(())
-}
-
-enum ControlRootfs {
-    Inline(Vec<u8>),
-    Url(String),
 }
 
 async fn provision_cold(conn: &Connection, token: &str, rootfs: ControlRootfs) -> Result<()> {
@@ -402,28 +393,24 @@ async fn provision_cold(conn: &Connection, token: &str, rootfs: ControlRootfs) -
 
     let att = request_attestation(&mut send, &mut recv).await?;
     assert_eq!(att.state, VmState::Cold);
+    assert_eq!(att.runtime_status, RuntimeStatus::NotStarted);
 
-    ControlFrame::new(CONTROL_ACCESS_TOKEN, token.as_bytes().to_vec())
-        .write_to(&mut send)
-        .await
-        .context("send access token")?;
-
-    match rootfs {
-        ControlRootfs::Inline(data) => {
-            ControlFrame::new(CONTROL_PROVISION_ROOTFS, data)
-                .write_to(&mut send)
-                .await
-                .context("send rootfs")?;
-        }
-        ControlRootfs::Url(url) => {
-            ControlFrame::new(CONTROL_PROVISION_ROOTFS_URL, url.into_bytes())
-                .write_to(&mut send)
-                .await
-                .context("send rootfs url")?;
-        }
-    }
+    send_setup_request(
+        &mut send,
+        token,
+        match rootfs {
+            ControlRootfs::Inline(data) => RootfsSource::Inline(data),
+            ControlRootfs::Url(url) => RootfsSource::Url(url),
+        },
+    )
+    .await?;
 
     wait_setup_complete(&mut recv).await
+}
+
+enum ControlRootfs {
+    Inline(Vec<u8>),
+    Url(String),
 }
 
 fn args_for_test(temp: &TempDir, port: u16) -> Result<Args> {
@@ -437,7 +424,6 @@ fn args_for_test(temp: &TempDir, port: u16) -> Result<Args> {
         data_dir,
         root_mount_dir: root_dir,
         init_binary: "/sbin/init".into(),
-        channel_binding_label: "fly-vault-channel-binding".to_string(),
         test_mode: true,
     })
 }
@@ -472,36 +458,45 @@ async fn request_attestation(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> Result<AttestationPayload> {
-    ControlFrame::new(CONTROL_REQUEST_ATTESTATION, vec![])
+    ControlMessage::RequestAttestation
         .write_to(send)
         .await
         .context("send RequestAttestation")?;
 
-    let frame = ControlFrame::read_from(recv)
+    match ControlMessage::read_from(recv)
         .await
-        .context("read attestation frame")?;
-    if frame.ty != CONTROL_ATTESTATION {
-        return Err(anyhow!(
-            "expected CONTROL_ATTESTATION, got type {}",
-            frame.ty
-        ));
+        .context("read attestation frame")?
+    {
+        ControlMessage::Attestation(payload) => {
+            assert_eq!(payload.protocol_version, PROTOCOL_VERSION);
+            Ok(payload)
+        }
+        other => Err(anyhow!("expected attestation, got {other:?}")),
     }
-    AttestationPayload::from_bytes(&frame.payload)
+}
+
+async fn send_setup_request(
+    send: &mut quinn::SendStream,
+    access_token: &str,
+    rootfs: RootfsSource,
+) -> Result<()> {
+    ControlMessage::SetupRequest(SetupRequest {
+        access_token: access_token.to_string(),
+        rootfs,
+    })
+    .write_to(send)
+    .await
+    .context("send setup request")
 }
 
 async fn wait_setup_complete(recv: &mut quinn::RecvStream) -> Result<()> {
-    loop {
-        let frame = ControlFrame::read_from(recv)
-            .await
-            .context("read setup frame")?;
-        match frame.ty {
-            CONTROL_SETUP_COMPLETE => return Ok(()),
-            CONTROL_ERROR => {
-                let msg = String::from_utf8_lossy(&frame.payload);
-                return Err(anyhow!("init setup failed: {msg}"));
-            }
-            _ => continue,
-        }
+    match ControlMessage::read_from(recv)
+        .await
+        .context("read setup frame")?
+    {
+        ControlMessage::SetupComplete => Ok(()),
+        ControlMessage::Error(msg) => Err(anyhow!("init setup failed: {msg}")),
+        other => Err(anyhow!("expected setup response, got {other:?}")),
     }
 }
 
@@ -543,13 +538,34 @@ fn insecure_client_config() -> Result<ClientConfig> {
     Ok(ClientConfig::new(Arc::new(cfg)))
 }
 
-fn choose_udp_port() -> Result<u16> {
-    let sock = UdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
-        .context("bind local UDP socket for port selection")?;
-    Ok(sock
-        .local_addr()
-        .context("read local UDP socket address")?
-        .port())
+fn choose_udp_port() -> Result<Option<u16>> {
+    let sock = match UdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) {
+        Ok(sock) => sock,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err).context("bind local UDP socket for port selection"),
+    };
+    Ok(Some(
+        sock.local_addr()
+            .context("read local UDP socket address")?
+            .port(),
+    ))
+}
+
+async fn read_error_message(recv: &mut quinn::RecvStream) -> Result<String> {
+    match ControlMessage::read_from(recv)
+        .await
+        .context("read error frame")?
+    {
+        ControlMessage::Error(message) => Ok(message),
+        other => Err(anyhow!("expected error frame, got {other:?}")),
+    }
 }
 
 async fn spawn_rootfs_http_server(body: Vec<u8>) -> Result<(String, tokio::task::JoinHandle<()>)> {

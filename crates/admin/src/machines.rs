@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fmt;
 
 #[derive(Clone)]
 pub struct MachinesClient {
@@ -108,14 +109,9 @@ impl MachinesClient {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(err) if remaining > chunk => {
-                    // 408 means the server-side poll expired — retry with remaining time.
-                    let msg = format!("{}", err);
-                    if msg.contains("408") {
-                        remaining -= chunk;
-                        continue;
-                    }
-                    return Err(err);
+                Err(err) if remaining > chunk && is_wait_timeout(&err) => {
+                    remaining -= chunk;
+                    continue;
                 }
                 Err(err) => return Err(err),
             }
@@ -254,8 +250,27 @@ async fn error_for_status(response: Response) -> Result<Response> {
     }
 
     let body = response.text().await.unwrap_or_default();
-    Err(anyhow!("machines api error {}: {}", status, body))
+    Err(ApiError { status, body }.into())
 }
+
+fn is_wait_timeout(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ApiError>()
+        .is_some_and(|api_error| api_error.status == reqwest::StatusCode::REQUEST_TIMEOUT)
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "machines api error {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateMachineRequest {
@@ -438,5 +453,28 @@ fn collect_statuses(value: &Value, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_wait_timeout, ApiError};
+
+    #[test]
+    fn wait_timeout_detects_structured_408_error() {
+        let err = anyhow::Error::new(ApiError {
+            status: reqwest::StatusCode::REQUEST_TIMEOUT,
+            body: "timeout".to_string(),
+        });
+        assert!(is_wait_timeout(&err));
+    }
+
+    #[test]
+    fn wait_timeout_ignores_other_statuses() {
+        let err = anyhow::Error::new(ApiError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "bad request".to_string(),
+        });
+        assert!(!is_wait_timeout(&err));
     }
 }

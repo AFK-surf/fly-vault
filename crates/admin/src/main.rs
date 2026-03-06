@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
     let app = cli
         .app
         .or_else(|| std::env::var("FLY_APP").ok())
-        .unwrap_or_else(|| "vault-tenants".to_string());
+        .ok_or_else(|| anyhow!("missing app (set --app or FLY_APP)"))?;
     let api_base = cli
         .api_base
         .or_else(|| std::env::var("FLY_API_BASE").ok())

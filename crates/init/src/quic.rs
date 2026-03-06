@@ -3,10 +3,8 @@ use crate::forward;
 use crate::{Args, SharedState};
 use anyhow::{anyhow, Context, Result};
 use protocol::{
-    AttestationPayload, ControlFrame, VmState, CONTROL_ACCESS_TOKEN, CONTROL_ATTESTATION,
-    CONTROL_ERROR, CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL,
-    CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONSOLE, STREAM_CONTROL,
-    STREAM_PORT_FORWARD,
+    AttestationPayload, ControlMessage, RootfsSource, SetupRequest, VmState, CHANNEL_BINDING_LABEL,
+    PROTOCOL_VERSION, STREAM_CONSOLE, STREAM_CONTROL, STREAM_PORT_FORWARD,
 };
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, ServerConfig};
 use std::net::SocketAddr;
@@ -145,6 +143,12 @@ async fn handle_connection(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ControlPhase {
+    AwaitAttestation,
+    AwaitSetupRequest { state: VmState },
+}
+
 async fn handle_control_stream(
     conn: &quinn::Connection,
     args: &Args,
@@ -152,12 +156,11 @@ async fn handle_control_stream(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> Result<bool> {
-    let mut rootfs_source: Option<RootfsSource> = None;
-    let mut token_verified = false;
+    let mut phase = ControlPhase::AwaitAttestation;
 
     loop {
-        let frame = match ControlFrame::read_from(recv).await {
-            Ok(frame) => frame,
+        let message = match ControlMessage::read_from(recv).await {
+            Ok(message) => message,
             Err(err) => {
                 if let Err(send_err) =
                     send_error(send, format!("control stream read error: {err:#}")).await
@@ -168,198 +171,117 @@ async fn handle_control_stream(
             }
         };
 
-        match frame.ty {
-            CONTROL_REQUEST_ATTESTATION => {
-                let mut ekm = [0u8; 32];
-                conn.export_keying_material(&mut ekm, args.channel_binding_label.as_bytes(), &[])
-                    .map_err(|_| anyhow!("export tls keying material failed"))?;
-
-                let aud = hex::encode(ekm);
-                let jwt = if args.test_mode {
-                    format!("test-mode-jwt:{aud}")
-                } else {
-                    attest::fetch_oidc_token(&aud).await?
-                };
-
-                let state = {
-                    let guard = shared.lock().await;
-                    guard.vm_state
-                };
-
-                let payload = AttestationPayload { state, jwt }.to_bytes();
-                ControlFrame::new(CONTROL_ATTESTATION, payload)
-                    .write_to(send)
-                    .await?;
+        phase = match (phase, message) {
+            (ControlPhase::AwaitAttestation, ControlMessage::RequestAttestation) => {
+                let payload = build_attestation(conn, args, shared).await?;
+                ControlMessage::Attestation(payload).write_to(send).await?;
+                let state = shared.lock().await.vm_state;
+                ControlPhase::AwaitSetupRequest { state }
             }
-            CONTROL_ACCESS_TOKEN => {
-                let client_token =
-                    String::from_utf8(frame.payload).context("access token not utf-8")?;
-
-                let state = {
-                    let guard = shared.lock().await;
-                    guard.vm_state
-                };
-
-                match state {
-                    VmState::Cold => {
-                        let expected = {
-                            let guard = shared.lock().await;
-                            guard.access_token.clone()
-                        };
-
-                        match expected {
-                            Some(expected)
-                                if token_matches_constant_time(&expected, &client_token) =>
-                            {
-                                token_verified = true;
-                                info!("access token accepted for cold boot");
-                            }
-                            Some(_) => {
-                                send_error(send, "access token mismatch".to_string()).await?;
-                                return Ok(false);
-                            }
-                            None => {
-                                send_error(
-                                    send,
-                                    "no ACCESS_TOKEN configured on this machine".to_string(),
-                                )
-                                .await?;
-                                return Ok(false);
-                            }
-                        }
+            (ControlPhase::AwaitAttestation, other) => {
+                send_error(send, format!("expected attestation request, got {other:?}")).await?;
+                return Ok(false);
+            }
+            (ControlPhase::AwaitSetupRequest { state }, ControlMessage::SetupRequest(request)) => {
+                match apply_setup_request(shared, state, request).await {
+                    Ok(()) => {
+                        ControlMessage::SetupComplete.write_to(send).await?;
+                        return Ok(true);
                     }
-                    VmState::Ready => {
-                        let expected = {
-                            let guard = shared.lock().await;
-                            guard.access_token.clone()
-                        };
-
-                        match expected {
-                            Some(expected)
-                                if token_matches_constant_time(&expected, &client_token) =>
-                            {
-                                token_verified = true;
-                                info!("access token verified for ready-state session");
-                            }
-                            Some(_) => {
-                                send_error(send, "access token verification failed".to_string())
-                                    .await?;
-                                return Ok(false);
-                            }
-                            None => {
-                                send_error(
-                                    send,
-                                    "no ACCESS_TOKEN configured on this machine".to_string(),
-                                )
-                                .await?;
-                                return Ok(false);
-                            }
-                        }
-
-                        if rootfs_source.is_none() {
-                            {
-                                let mut guard = shared.lock().await;
-                                if let Err(err) = guard.setup.ensure_live_inner_init_pid() {
-                                    drop(guard);
-                                    send_error(
-                                        send,
-                                        format!(
-                                            "runtime unavailable after authentication: {err:#}"
-                                        ),
-                                    )
-                                    .await?;
-                                    return Ok(false);
-                                }
-                            }
-                            ControlFrame::new(CONTROL_SETUP_COMPLETE, vec![])
-                                .write_to(send)
-                                .await?;
-                            return Ok(true);
-                        }
+                    Err(err) => {
+                        send_error(send, format!("setup failed: {err:#}")).await?;
+                        return Ok(false);
                     }
                 }
             }
-            CONTROL_PROVISION_ROOTFS => {
-                let state = {
-                    let guard = shared.lock().await;
-                    guard.vm_state
-                };
-                if state == VmState::Cold && !token_verified {
-                    send_error(
-                        send,
-                        "access token required before provisioning rootfs".to_string(),
-                    )
-                    .await?;
-                    return Ok(false);
-                }
-                rootfs_source = Some(RootfsSource::Inline(frame.payload));
-            }
-            CONTROL_PROVISION_ROOTFS_URL => {
-                let state = {
-                    let guard = shared.lock().await;
-                    guard.vm_state
-                };
-                if state == VmState::Cold && !token_verified {
-                    send_error(
-                        send,
-                        "access token required before provisioning rootfs".to_string(),
-                    )
-                    .await?;
-                    return Ok(false);
-                }
-                let rootfs_url =
-                    String::from_utf8(frame.payload).context("rootfs url payload not utf-8")?;
-                rootfs_source = Some(RootfsSource::Url(rootfs_url));
-            }
-            _ => {
-                send_error(send, format!("unknown control type: {}", frame.ty)).await?;
-                continue;
-            }
-        }
-
-        if !token_verified || rootfs_source.is_none() {
-            continue;
-        }
-
-        let rootfs_tarball = match resolve_rootfs_source(rootfs_source.take()).await {
-            Ok(data) => data,
-            Err(err) => {
-                send_error(send, format!("resolve rootfs source failed: {err:#}")).await?;
+            (ControlPhase::AwaitSetupRequest { .. }, other) => {
+                send_error(send, format!("expected setup request, got {other:?}")).await?;
                 return Ok(false);
             }
         };
-
-        let mut guard = shared.lock().await;
-        match guard.setup.setup_and_prepare(rootfs_tarball).await {
-            Ok(()) => {
-                guard.vm_state = VmState::Ready;
-                drop(guard);
-                info!("setup complete");
-                ControlFrame::new(CONTROL_SETUP_COMPLETE, vec![])
-                    .write_to(send)
-                    .await?;
-                return Ok(true);
-            }
-            Err(err) => {
-                drop(guard);
-                send_error(send, format!("setup failed: {err:#}")).await?;
-                return Ok(false);
-            }
-        }
     }
 }
 
-#[derive(Debug)]
-enum RootfsSource {
-    Inline(Vec<u8>),
-    Url(String),
+async fn build_attestation(
+    conn: &quinn::Connection,
+    args: &Args,
+    shared: &Arc<Mutex<SharedState>>,
+) -> Result<AttestationPayload> {
+    let mut ekm = [0u8; 32];
+    conn.export_keying_material(&mut ekm, CHANNEL_BINDING_LABEL.as_bytes(), &[])
+        .map_err(|_| anyhow!("export tls keying material failed"))?;
+
+    let aud = hex::encode(ekm);
+    let jwt = if args.test_mode {
+        format!("test-mode-jwt:{aud}")
+    } else {
+        attest::fetch_oidc_token(&aud).await?
+    };
+
+    let mut guard = shared.lock().await;
+    guard.vm_state = guard.setup.detect_state()?;
+    if guard.vm_state == VmState::Ready {
+        guard
+            .setup
+            .ensure_live_inner_init_pid()
+            .context("ensure live runtime before attestation")?;
+        guard.vm_state = guard.setup.detect_state()?;
+    }
+    Ok(AttestationPayload {
+        protocol_version: PROTOCOL_VERSION,
+        state: guard.vm_state,
+        runtime_status: guard.setup.runtime_status()?,
+        jwt,
+    })
 }
 
-async fn resolve_rootfs_source(source: Option<RootfsSource>) -> Result<Option<Vec<u8>>> {
+async fn apply_setup_request(
+    shared: &Arc<Mutex<SharedState>>,
+    state: VmState,
+    request: SetupRequest,
+) -> Result<()> {
+    let expected = {
+        let guard = shared.lock().await;
+        guard.access_token.clone()
+    };
+    verify_access_token(expected.as_deref(), &request.access_token)?;
+
+    let rootfs_tarball = resolve_rootfs_source(request.rootfs).await?;
+    validate_rootfs_request(state, rootfs_tarball.as_ref())?;
+
+    let mut guard = shared.lock().await;
+    guard.setup.setup_and_prepare(rootfs_tarball).await?;
+    guard.vm_state = guard.setup.detect_state()?;
+    let runtime_status = guard.setup.runtime_status()?;
+    let state = guard.vm_state;
+    info!(
+        state = ?state,
+        runtime_status = ?runtime_status,
+        "setup complete"
+    );
+    Ok(())
+}
+
+fn verify_access_token(expected: Option<&str>, provided: &str) -> Result<()> {
+    match expected {
+        Some(expected) if token_matches_constant_time(expected, provided) => Ok(()),
+        Some(_) => Err(anyhow!("access token verification failed")),
+        None => Err(anyhow!("no ACCESS_TOKEN configured on this machine")),
+    }
+}
+
+fn validate_rootfs_request(state: VmState, rootfs_tarball: Option<&Vec<u8>>) -> Result<()> {
+    if state == VmState::Cold && rootfs_tarball.is_none() {
+        return Err(anyhow!("cold boot requires a rootfs payload"));
+    }
+    Ok(())
+}
+
+async fn resolve_rootfs_source(source: RootfsSource) -> Result<Option<Vec<u8>>> {
     match source {
-        None => Ok(None),
-        Some(RootfsSource::Inline(data)) => Ok(Some(data)),
-        Some(RootfsSource::Url(url)) => Ok(Some(download_rootfs_tarball(&url).await?)),
+        RootfsSource::None => Ok(None),
+        RootfsSource::Inline(data) => Ok(Some(data)),
+        RootfsSource::Url(url) => Ok(Some(download_rootfs_tarball(&url).await?)),
     }
 }
 
@@ -392,9 +314,7 @@ async fn download_rootfs_tarball(url_str: &str) -> Result<Vec<u8>> {
 }
 
 async fn send_error(send: &mut quinn::SendStream, msg: String) -> Result<()> {
-    ControlFrame::new(CONTROL_ERROR, msg.into_bytes())
-        .write_to(send)
-        .await
+    ControlMessage::Error(msg).write_to(send).await
 }
 
 fn token_matches_constant_time(expected: &str, provided: &str) -> bool {

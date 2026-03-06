@@ -1866,6 +1866,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "protocol",
  "reqwest",
  "serde",
  "serde_json",

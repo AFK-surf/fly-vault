@@ -2,12 +2,11 @@ use crate::attest;
 use crate::console;
 use crate::forward;
 use crate::proxy_udp::ProxyUdpSocket;
-use crate::VaultConfig;
+use crate::{TransportConfig, VaultConfig};
 use anyhow::{anyhow, Context, Result};
 use protocol::{
-    AttestationPayload, ControlFrame, VmState, CONTROL_ACCESS_TOKEN, CONTROL_ATTESTATION,
-    CONTROL_ERROR, CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL,
-    CONTROL_REQUEST_ATTESTATION, CONTROL_SETUP_COMPLETE, STREAM_CONTROL,
+    AttestationPayload, ControlMessage, RootfsSource, RuntimeStatus, SetupRequest, VmState,
+    CHANNEL_BINDING_LABEL, PROTOCOL_VERSION, STREAM_CONTROL,
 };
 use quinn::{default_runtime, ClientConfig, Endpoint, EndpointConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -19,7 +18,11 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
-pub async fn connect_and_run(cfg: VaultConfig, forwards: Vec<String>, reprovision: bool) -> Result<()> {
+pub async fn connect_and_run(
+    cfg: VaultConfig,
+    forwards: Vec<String>,
+    reprovision: bool,
+) -> Result<()> {
     let conn = connect_ready(&cfg, reprovision).await?;
 
     if forwards.is_empty() {
@@ -42,7 +45,8 @@ pub async fn connect_and_exec(cfg: VaultConfig, command: Vec<String>) -> Result<
 }
 
 async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Connection> {
-    let mut endpoint = build_client_endpoint(cfg.machine_id.clone())?;
+    let transport = cfg.transport();
+    let mut endpoint = build_client_endpoint(&transport)?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
     let remote = resolve_addr(&cfg.address)?;
@@ -51,26 +55,64 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
         .context("connect quic")?;
     let conn = connect.await.context("await quic connect")?;
 
-    let mut ekm = [0u8; 32];
-    conn.export_keying_material(&mut ekm, b"fly-vault-channel-binding", &[])
-        .map_err(|_| anyhow!("export keying material failed"))?;
-    let aud = hex::encode(ekm);
-
+    let aud = export_attestation_audience(&conn)?;
     let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
     send.write_u8(STREAM_CONTROL)
         .await
         .context("write control stream tag")?;
 
-    ControlFrame::new(CONTROL_REQUEST_ATTESTATION, vec![])
+    ControlMessage::RequestAttestation
         .write_to(&mut send)
-        .await?;
+        .await
+        .context("request attestation")?;
 
-    let frame = ControlFrame::read_from(&mut recv).await?;
-    if frame.ty != CONTROL_ATTESTATION {
-        return Err(anyhow!("expected attestation frame, got type {}", frame.ty));
+    let attestation = match ControlMessage::read_from(&mut recv).await? {
+        ControlMessage::Attestation(payload) => payload,
+        other => return Err(anyhow!("expected attestation frame, got {other:?}")),
+    };
+    validate_attestation(cfg, &transport, &attestation, &aud).await?;
+
+    let access_token = cfg
+        .access_token
+        .clone()
+        .ok_or_else(|| anyhow!("access_token is required"))?;
+    let rootfs = provisioning_source(cfg, attestation.state, reprovision).await?;
+
+    ControlMessage::SetupRequest(SetupRequest {
+        access_token,
+        rootfs,
+    })
+    .write_to(&mut send)
+    .await
+    .context("send setup request")?;
+
+    match ControlMessage::read_from(&mut recv).await? {
+        ControlMessage::SetupComplete => Ok(conn),
+        ControlMessage::Error(message) => Err(anyhow!("server setup error: {message}")),
+        other => Err(anyhow!("expected setup response, got {other:?}")),
     }
+}
 
-    let attestation = AttestationPayload::from_bytes(&frame.payload)?;
+fn export_attestation_audience(conn: &quinn::Connection) -> Result<String> {
+    let mut ekm = [0u8; 32];
+    conn.export_keying_material(&mut ekm, CHANNEL_BINDING_LABEL.as_bytes(), &[])
+        .map_err(|_| anyhow!("export keying material failed"))?;
+    Ok(hex::encode(ekm))
+}
+
+async fn validate_attestation(
+    cfg: &VaultConfig,
+    transport: &TransportConfig,
+    attestation: &AttestationPayload,
+    aud: &str,
+) -> Result<()> {
+    if attestation.protocol_version != PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "protocol version mismatch: server={} client={}",
+            attestation.protocol_version,
+            PROTOCOL_VERSION
+        ));
+    }
 
     let http_client = reqwest::Client::builder()
         .use_rustls_tls()
@@ -78,64 +120,63 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
         .context("build reqwest client")?;
 
     let claims =
-        attest::verify_attestation_jwt(&http_client, &attestation.jwt, &cfg.org, &aud).await?;
-    assert_org_and_app(&claims.iss, &claims.app_name, &cfg)?;
-    assert_machine_id(&claims.machine_id, &cfg)?;
+        attest::verify_attestation_jwt(&http_client, &attestation.jwt, &cfg.org, aud).await?;
+    assert_org_and_app(&claims.iss, &claims.app_name, cfg)?;
+    assert_machine_id(&claims.machine_id, transport)?;
+    assert_runtime_status(attestation)?;
     info!(
         issuer = %claims.iss,
         app = %claims.app_name,
         machine = %claims.machine_id,
+        state = ?attestation.state,
+        runtime_status = ?attestation.runtime_status,
         "attestation verified"
     );
-
-    tracing::info!(state = ?attestation.state, "vm state");
-
-    let access_token = cfg
-        .access_token
-        .clone()
-        .ok_or_else(|| anyhow!("access_token is required"))?;
-
-    match attestation.state {
-        VmState::Cold => {
-            ControlFrame::new(CONTROL_ACCESS_TOKEN, access_token.into_bytes())
-                .write_to(&mut send)
-                .await?;
-            send_rootfs_provision(&cfg, &mut send, "cold boot").await?;
-            wait_for_setup_complete(&mut recv).await?;
-        }
-        VmState::Ready => {
-            if reprovision {
-                send_rootfs_provision(&cfg, &mut send, "--reprovision").await?;
-            }
-            ControlFrame::new(CONTROL_ACCESS_TOKEN, access_token.into_bytes())
-                .write_to(&mut send)
-                .await?;
-            wait_for_setup_complete(&mut recv).await?;
-        }
-    }
-
-    Ok(conn)
+    Ok(())
 }
 
-async fn send_rootfs_provision(
+fn assert_runtime_status(attestation: &AttestationPayload) -> Result<()> {
+    match (attestation.state, attestation.runtime_status) {
+        (VmState::Cold, RuntimeStatus::NotStarted) => Ok(()),
+        (VmState::Ready, RuntimeStatus::SystemInit) => Ok(()),
+        (VmState::Ready, RuntimeStatus::FallbackInit) => {
+            Err(anyhow!("server runtime degraded: fallback init is active"))
+        }
+        (VmState::Cold, status) => Err(anyhow!(
+            "invalid cold-state runtime status reported by server: {status:?}"
+        )),
+        (VmState::Ready, status) => Err(anyhow!(
+            "invalid ready-state runtime status reported by server: {status:?}"
+        )),
+    }
+}
+
+async fn provisioning_source(
     cfg: &VaultConfig,
-    send: &mut quinn::SendStream,
-    phase: &str,
-) -> Result<()> {
+    state: VmState,
+    reprovision: bool,
+) -> Result<RootfsSource> {
+    if state == VmState::Ready && !reprovision {
+        return Ok(RootfsSource::None);
+    }
+
     match (&cfg.rootfs, &cfg.rootfs_url) {
         (Some(_), Some(_)) => Err(anyhow!(
-            "both rootfs and rootfs_url are set; configure exactly one for {phase}"
+            "both rootfs and rootfs_url are set; configure exactly one"
         )),
         (None, None) => Err(anyhow!(
-            "either rootfs path or rootfs_url is required for {phase}"
+            "either rootfs path or rootfs_url is required for {}",
+            if state == VmState::Cold {
+                "cold boot"
+            } else {
+                "reprovision"
+            }
         )),
         (Some(rootfs_path), None) => {
             let rootfs_bytes = tokio::fs::read(expand_tilde(rootfs_path)?)
                 .await
                 .with_context(|| format!("read rootfs {}", rootfs_path))?;
-            ControlFrame::new(CONTROL_PROVISION_ROOTFS, rootfs_bytes)
-                .write_to(send)
-                .await
+            Ok(RootfsSource::Inline(rootfs_bytes))
         }
         (None, Some(rootfs_url)) => {
             let parsed = url::Url::parse(rootfs_url)
@@ -146,27 +187,7 @@ async fn send_rootfs_provision(
                     parsed.scheme()
                 ));
             }
-            ControlFrame::new(
-                CONTROL_PROVISION_ROOTFS_URL,
-                parsed.as_str().as_bytes().to_vec(),
-            )
-            .write_to(send)
-            .await
-        }
-    }
-}
-
-async fn wait_for_setup_complete(recv: &mut quinn::RecvStream) -> Result<()> {
-    loop {
-        let frame = ControlFrame::read_from(recv).await?;
-        match frame.ty {
-            CONTROL_SETUP_COMPLETE => return Ok(()),
-            CONTROL_ERROR => {
-                let msg = String::from_utf8(frame.payload)
-                    .unwrap_or_else(|_| "<non-utf8 error>".to_string());
-                return Err(anyhow!("server setup error: {msg}"));
-            }
-            _ => continue,
+            Ok(RootfsSource::Url(parsed.to_string()))
         }
     }
 }
@@ -180,14 +201,16 @@ fn resolve_addr(addr: &str) -> Result<SocketAddr> {
     Ok(resolved)
 }
 
-fn build_client_endpoint(machine_id: Option<String>) -> Result<Endpoint> {
-    match machine_id {
-        Some(machine_id) => build_proxy_endpoint(machine_id),
-        None => Endpoint::client("[::]:0".parse().unwrap()).context("create quic client"),
+fn build_client_endpoint(transport: &TransportConfig) -> Result<Endpoint> {
+    match transport {
+        TransportConfig::Direct => {
+            Endpoint::client("[::]:0".parse().unwrap()).context("create quic client")
+        }
+        TransportConfig::Proxy { machine_id } => build_proxy_endpoint(machine_id),
     }
 }
 
-fn build_proxy_endpoint(machine_id: String) -> Result<Endpoint> {
+fn build_proxy_endpoint(machine_id: &str) -> Result<Endpoint> {
     let runtime = default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
     let socket = std::net::UdpSocket::bind("[::]:0")
         .or_else(|_| std::net::UdpSocket::bind("0.0.0.0:0"))
@@ -196,7 +219,7 @@ fn build_proxy_endpoint(machine_id: String) -> Result<Endpoint> {
         .wrap_udp_socket(socket)
         .context("wrap proxy-mode udp socket")?;
     let proxy_socket = Arc::new(
-        ProxyUdpSocket::new(wrapped, machine_id)
+        ProxyUdpSocket::new(wrapped, machine_id.to_string())
             .map_err(|e| anyhow!("configure proxy-mode udp socket: {e}"))?,
     );
     Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, proxy_socket, runtime)
@@ -257,13 +280,13 @@ fn assert_org_and_app(issuer: &str, app_name: &str, cfg: &VaultConfig) -> Result
     Ok(())
 }
 
-fn assert_machine_id(attested_machine_id: &str, cfg: &VaultConfig) -> Result<()> {
-    if let Some(expected_machine_id) = cfg.machine_id.as_deref() {
-        if attested_machine_id != expected_machine_id {
+fn assert_machine_id(attested_machine_id: &str, transport: &TransportConfig) -> Result<()> {
+    if let TransportConfig::Proxy { machine_id } = transport {
+        if attested_machine_id != machine_id {
             return Err(anyhow!(
                 "attestation machine mismatch: machine_id={} expected={}",
                 attested_machine_id,
-                expected_machine_id
+                machine_id
             ));
         }
     }
@@ -316,14 +339,17 @@ impl ServerCertVerifier for NoVerifier {
 #[cfg(test)]
 mod tests {
     use super::assert_machine_id;
-    use crate::VaultConfig;
+    use crate::{TransportConfig, VaultConfig};
 
-    fn make_cfg(machine_id: Option<&str>) -> VaultConfig {
+    fn make_cfg(transport: TransportConfig) -> VaultConfig {
         VaultConfig {
             address: "127.0.0.1:443".to_string(),
             org: "test-org".to_string(),
             app: "test-app".to_string(),
-            machine_id: machine_id.map(str::to_string),
+            machine_id: match transport {
+                TransportConfig::Direct => None,
+                TransportConfig::Proxy { machine_id } => Some(machine_id),
+            },
             forward: vec![],
             rootfs: None,
             rootfs_url: None,
@@ -332,21 +358,28 @@ mod tests {
     }
 
     #[test]
-    fn machine_id_check_skips_when_not_configured() {
-        let cfg = make_cfg(None);
-        assert_machine_id("machine-any", &cfg).expect("machine id should not be enforced");
+    fn machine_id_check_skips_when_direct_transport_is_configured() {
+        let cfg = make_cfg(TransportConfig::Direct);
+        assert_machine_id("machine-any", &cfg.transport())
+            .expect("machine id should not be enforced");
     }
 
     #[test]
-    fn machine_id_check_accepts_match() {
-        let cfg = make_cfg(Some("machine-123"));
-        assert_machine_id("machine-123", &cfg).expect("matching machine id should pass");
+    fn machine_id_check_accepts_proxy_match() {
+        let cfg = make_cfg(TransportConfig::Proxy {
+            machine_id: "machine-123".to_string(),
+        });
+        assert_machine_id("machine-123", &cfg.transport())
+            .expect("matching machine id should pass");
     }
 
     #[test]
-    fn machine_id_check_rejects_mismatch() {
-        let cfg = make_cfg(Some("machine-123"));
-        let err = assert_machine_id("machine-999", &cfg).expect_err("mismatched machine id");
+    fn machine_id_check_rejects_proxy_mismatch() {
+        let cfg = make_cfg(TransportConfig::Proxy {
+            machine_id: "machine-123".to_string(),
+        });
+        let err =
+            assert_machine_id("machine-999", &cfg.transport()).expect_err("mismatched machine id");
         assert!(err
             .to_string()
             .contains("attestation machine mismatch: machine_id=machine-999 expected=machine-123"));

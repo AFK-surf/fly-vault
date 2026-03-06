@@ -30,9 +30,6 @@ struct Args {
     #[arg(long, default_value = "/sbin/init")]
     init_binary: PathBuf,
 
-    #[arg(long, default_value = "fly-vault-channel-binding")]
-    channel_binding_label: String,
-
     #[arg(long, default_value_t = false)]
     test_mode: bool,
 }
@@ -80,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
             .start_ready_runtime()
             .context("start namespaced init for ready state")?;
     }
+    let initial_state = setup.detect_state()?;
 
     let shared = Arc::new(Mutex::new(SharedState {
         vm_state: initial_state,

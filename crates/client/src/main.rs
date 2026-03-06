@@ -56,6 +56,23 @@ struct VaultConfig {
     access_token: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportConfig {
+    Direct,
+    Proxy { machine_id: String },
+}
+
+impl VaultConfig {
+    fn transport(&self) -> TransportConfig {
+        match &self.machine_id {
+            Some(machine_id) => TransportConfig::Proxy {
+                machine_id: machine_id.clone(),
+            },
+            None => TransportConfig::Direct,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -92,9 +109,8 @@ async fn main() -> Result<()> {
             let command = command
                 .into_iter()
                 .map(|arg| {
-                    arg.into_string().map_err(|arg| {
-                        anyhow!("exec arguments must be valid UTF-8: {:?}", arg)
-                    })
+                    arg.into_string()
+                        .map_err(|arg| anyhow!("exec arguments must be valid UTF-8: {:?}", arg))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let exit_code = quic::connect_and_exec(vault_cfg, command).await?;
@@ -144,10 +160,7 @@ fn config_path() -> Result<PathBuf> {
     Ok(base.join("fly-vault").join("config.toml"))
 }
 
-fn resolve_vault_config(
-    cfg_file: &mut ConfigFile,
-    vault: &str,
-) -> Result<VaultConfig> {
+fn resolve_vault_config(cfg_file: &mut ConfigFile, vault: &str) -> Result<VaultConfig> {
     cfg_file.vault.remove(vault).ok_or_else(|| {
         anyhow!(
             "vault {vault} not found in {}",
@@ -160,7 +173,7 @@ fn resolve_vault_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_vault_config, Cli, Command, ConfigFile, VaultConfig};
+    use super::{resolve_vault_config, Cli, Command, ConfigFile, TransportConfig, VaultConfig};
     use clap::Parser;
     use std::collections::HashMap;
 
@@ -173,7 +186,12 @@ app = "my-app"
 machine_id = "abc123"
 "#;
         let cfg: VaultConfig = toml::from_str(raw).expect("parse config with machine_id");
-        assert_eq!(cfg.machine_id.as_deref(), Some("abc123"));
+        assert_eq!(
+            cfg.transport(),
+            TransportConfig::Proxy {
+                machine_id: "abc123".to_string()
+            }
+        );
     }
 
     #[test]
@@ -184,7 +202,7 @@ org = "my-org"
 app = "my-app"
 "#;
         let cfg: VaultConfig = toml::from_str(raw).expect("parse config without machine_id");
-        assert!(cfg.machine_id.is_none());
+        assert_eq!(cfg.transport(), TransportConfig::Direct);
     }
 
     #[test]

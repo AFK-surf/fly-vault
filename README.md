@@ -64,6 +64,13 @@ Example:
 address = "[fdaa:x:x::x]:8443"
 org = "my-org"
 app = "my-dev-vault"
+
+#[vault.my-proxy]
+#address = "proxy.fly.dev:443"
+#org = "my-org"
+#app = "my-proxy-vault"
+#machine_id = "148e21ea7e46e8"
+
 access_token = "secret-token-here"
 forward = ["8080:localhost:8080"]
 rootfs = "~/.config/fly-vault/rootfs/dev-env.tar.gz"
@@ -95,7 +102,7 @@ cargo run -p fly-vault -- exec <vault-name> -- uname -a
 Auth/config:
 
 - `--api-token` or `FLY_API_TOKEN` (required)
-- `--app` or `FLY_APP` (defaults to `vault-tenants`)
+- `--app` or `FLY_APP` (required)
 - `--api-base` or `FLY_API_BASE` (defaults to `https://api.machines.dev`)
 
 Tenant template snippet:

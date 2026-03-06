@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,14 +31,14 @@ pub async fn get_or_create_session(
     frontend: &Arc<UdpSocket>,
     client_addr: SocketAddr,
     backend_addr: SocketAddr,
-) -> Arc<Session> {
+) -> Result<Arc<Session>> {
     // Fast path: read lock
     {
         let map = sessions.read().await;
         if let Some(session) = map.get(&client_addr) {
             if session.backend_addr == backend_addr {
                 session.last_activity.store(now_secs(), Ordering::Relaxed);
-                return Arc::clone(session);
+                return Ok(Arc::clone(session));
             }
             // Backend changed — fall through to recreate
         } else {
@@ -64,14 +65,14 @@ async fn create_session(
     frontend: &Arc<UdpSocket>,
     client_addr: SocketAddr,
     backend_addr: SocketAddr,
-) -> Arc<Session> {
+) -> Result<Arc<Session>> {
     let mut map = sessions.write().await;
 
     // Double-check after acquiring write lock
     if let Some(session) = map.get(&client_addr) {
         if session.backend_addr == backend_addr {
             session.last_activity.store(now_secs(), Ordering::Relaxed);
-            return Arc::clone(session);
+            return Ok(Arc::clone(session));
         }
         // Still mismatched — remove
         if let Some(old) = map.remove(&client_addr) {
@@ -82,12 +83,12 @@ async fn create_session(
     let backend_sock = Arc::new(
         UdpSocket::bind("[::]:0")
             .await
-            .expect("bind backend socket"),
+            .context("bind backend socket")?,
     );
     backend_sock
         .connect(backend_addr)
         .await
-        .expect("connect backend socket");
+        .with_context(|| format!("connect backend socket to {}", backend_addr))?;
 
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
 
@@ -107,7 +108,7 @@ async fn create_session(
 
     debug!(%client_addr, %backend_addr, "created new session");
     map.insert(client_addr, Arc::clone(&session));
-    session
+    Ok(session)
 }
 
 fn spawn_relay(

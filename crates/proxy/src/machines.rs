@@ -14,7 +14,6 @@ pub type MachineMap = Arc<RwLock<HashMap<String, IpAddr>>>;
 #[derive(Clone, Debug)]
 pub struct MachineInfo {
     pub state: String,
-    pub private_ip: Option<IpAddr>,
 }
 
 pub type FullMachineMap = Arc<RwLock<HashMap<String, MachineInfo>>>;
@@ -46,7 +45,6 @@ pub async fn refresh_once(
                     entry.id.clone(),
                     MachineInfo {
                         state: entry.state.clone(),
-                        private_ip: ip,
                     },
                 );
                 if entry.state == "started" {

@@ -37,6 +37,12 @@ struct MachineSnapshot {
     previous_image: String,
 }
 
+#[derive(Debug)]
+struct UpdateFailure {
+    error: anyhow::Error,
+    rollback_target: Option<MachineSnapshot>,
+}
+
 pub async fn update_image(client: &MachinesClient, options: UpdateImageOptions) -> Result<()> {
     validate_selectors(&options)?;
     if options.concurrency == 0 {
@@ -101,9 +107,10 @@ pub async fn update_image(client: &MachinesClient, options: UpdateImageOptions) 
             snapshot.tenant_id
         );
 
-        if let Err(err) = update_one_machine(client, snapshot, &options.image, &options).await {
-            rollback(client, &updated, &options).await;
-            return Err(err.context("canary stage failed"));
+        if let Err(failure) = update_one_machine(client, snapshot, &options.image, &options).await {
+            let rollback_targets = rollback_targets(&updated, std::slice::from_ref(&failure));
+            rollback(client, &rollback_targets, &options).await;
+            return Err(failure.error.context("canary stage failed"));
         }
         updated.push(snapshot.clone());
     }
@@ -158,22 +165,26 @@ pub async fn update_image(client: &MachinesClient, options: UpdateImageOptions) 
             });
         }
 
-        let mut batch_errors = Vec::new();
+        let mut batch_failures = Vec::new();
         while let Some(joined) = join_set.join_next().await {
             match joined {
                 Ok(Ok(snapshot)) => updated.push(snapshot),
-                Ok(Err(err)) => batch_errors.push(err),
-                Err(err) => batch_errors.push(anyhow!("rollout task join error: {}", err)),
+                Ok(Err(failure)) => batch_failures.push(failure),
+                Err(err) => batch_failures.push(UpdateFailure {
+                    error: anyhow!("rollout task join error: {}", err),
+                    rollback_target: None,
+                }),
             }
         }
 
-        if !batch_errors.is_empty() {
-            rollback(client, &updated, &options).await;
+        if !batch_failures.is_empty() {
+            let rollback_targets = rollback_targets(&updated, &batch_failures);
+            rollback(client, &rollback_targets, &options).await;
             return Err(anyhow!(
                 "rolling stage failed:\n{}",
-                batch_errors
+                batch_failures
                     .into_iter()
-                    .map(|err| format!("- {}", err))
+                    .map(|failure| format!("- {}", failure.error))
                     .collect::<Vec<_>>()
                     .join("\n")
             ));
@@ -268,16 +279,40 @@ fn select_canary_indices(targets: &[MachineSnapshot], count: usize) -> Vec<usize
     picked
 }
 
+fn rollback_targets(
+    updated: &[MachineSnapshot],
+    failures: &[UpdateFailure],
+) -> Vec<MachineSnapshot> {
+    let mut rollback_targets = updated.to_vec();
+    for failure in failures {
+        if let Some(snapshot) = &failure.rollback_target {
+            if !rollback_targets
+                .iter()
+                .any(|existing| existing.machine_id == snapshot.machine_id)
+            {
+                rollback_targets.push(snapshot.clone());
+            }
+        }
+    }
+    rollback_targets
+}
+
 async fn update_one_machine(
     client: &MachinesClient,
     snapshot: &MachineSnapshot,
     image: &str,
     options: &UpdateImageOptions,
-) -> Result<()> {
+) -> std::result::Result<MachineSnapshot, UpdateFailure> {
     let lease = client
         .create_lease(&snapshot.machine_id, options.lease_ttl_secs)
         .await
-        .with_context(|| format!("lease machine {}", snapshot.machine_id))?;
+        .with_context(|| format!("lease machine {}", snapshot.machine_id))
+        .map_err(|error| UpdateFailure {
+            error,
+            rollback_target: None,
+        })?;
+
+    let mut rollback_target = None;
 
     let mut operation_result = async {
         client
@@ -300,6 +335,7 @@ async fn update_one_machine(
             .update_machine(&snapshot.machine_id, &request, Some(&lease.nonce))
             .await
             .with_context(|| format!("update image for machine {}", snapshot.machine_id))?;
+        rollback_target = Some(snapshot.clone());
 
         client
             .wait_for_state(&snapshot.machine_id, "started", options.start_timeout, None)
@@ -319,7 +355,7 @@ async fn update_one_machine(
             .await
             .with_context(|| format!("uncordon machine {}", snapshot.machine_id))?;
 
-        Result::<()>::Ok(())
+        Result::<MachineSnapshot>::Ok(snapshot.clone())
     }
     .await;
 
@@ -342,7 +378,10 @@ async fn update_one_machine(
         }
     }
 
-    operation_result
+    operation_result.map_err(|error| UpdateFailure {
+        error,
+        rollback_target,
+    })
 }
 
 async fn rollback(
@@ -453,4 +492,46 @@ async fn rollback_one_machine(
     }
 
     operation_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rollback_targets, MachineSnapshot, UpdateFailure};
+    use anyhow::anyhow;
+    use std::collections::HashMap;
+
+    fn snapshot(machine_id: &str) -> MachineSnapshot {
+        MachineSnapshot {
+            machine_id: machine_id.to_string(),
+            tenant_id: "tenant".to_string(),
+            name: None,
+            region: None,
+            metadata: HashMap::new(),
+            config: serde_json::json!({}),
+            current_version: "v1".to_string(),
+            previous_image: "old-image".to_string(),
+        }
+    }
+
+    #[test]
+    fn rollback_targets_include_failed_machine_once() {
+        let updated = vec![snapshot("one")];
+        let failures = vec![
+            UpdateFailure {
+                error: anyhow!("boom"),
+                rollback_target: Some(snapshot("two")),
+            },
+            UpdateFailure {
+                error: anyhow!("boom again"),
+                rollback_target: Some(snapshot("one")),
+            },
+        ];
+
+        let targets = rollback_targets(&updated, &failures);
+        let machine_ids = targets
+            .into_iter()
+            .map(|snapshot| snapshot.machine_id)
+            .collect::<Vec<_>>();
+        assert_eq!(machine_ids, vec!["one".to_string(), "two".to_string()]);
+    }
 }

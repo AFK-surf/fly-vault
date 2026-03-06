@@ -15,7 +15,11 @@ pub async fn run_console(conn: quinn::Connection) -> Result<()> {
 }
 
 pub async fn run_exec(conn: quinn::Connection, argv: Vec<String>) -> Result<u32> {
-    run_session(conn, ConsoleFrame::new(CONSOLE_EXEC, encode_exec_argv(&argv))).await
+    run_session(
+        conn,
+        ConsoleFrame::new(CONSOLE_EXEC, encode_exec_argv(&argv)),
+    )
+    .await
 }
 
 async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u32> {
@@ -213,23 +217,30 @@ fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
 
 async fn read_stdin(stdin: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
     loop {
+        if let Some(result) = try_read_fd(stdin.get_ref().as_raw_fd(), buf)? {
+            return Ok(result);
+        }
+
         let mut guard = stdin.readable().await.context("wait for stdin readable")?;
         match guard.try_io(|inner| {
-            let n = unsafe {
-                libc::read(
-                    inner.get_ref().as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                )
-            };
-            if n < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
+            try_read_fd(inner.get_ref().as_raw_fd(), buf)?
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))
         }) {
             Ok(result) => return result.context("read local stdin"),
             Err(_would_block) => continue,
         }
+    }
+}
+
+fn try_read_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n >= 0 {
+        return Ok(Some(n as usize));
+    }
+
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EAGAIN) => Ok(None),
+        _ => Err(err),
     }
 }

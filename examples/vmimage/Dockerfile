@@ -8,14 +8,17 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Install systemd + a minimal, practical base userland.
-# (Add/remove packages to match what you want "in the VM".)
+# Includes the tools the remote-task skill expects:
+# - `tmux` for interactive reattachment
+# - `setsid` from util-linux for detached tasks
+# - `ps` from procps for pid/pgid capture
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       systemd systemd-sysv dbus dbus-user-session \
       ca-certificates curl wget gnupg \
       iproute2 iputils-ping net-tools \
       openssh-server sudo \
-      vim-tiny less procps kmod udev \
+      vim-tiny less procps util-linux tmux kmod udev \
       locales tzdata && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 

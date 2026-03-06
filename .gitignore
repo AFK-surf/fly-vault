@@ -1,2 +1,7 @@
 /target
+/dist/
+/skills/remote-task/assets/bin/
 *.tar.gz
+.swp
+*.swp
+__pycache__/

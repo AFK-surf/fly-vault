@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Task"
+  short_description: "Run durable tasks on Fly vault VMs"
+  default_prompt: "Use $remote-task to connect to a fly-vault VM, start a durable remote task with explicit context, and manage or reattach to existing tasks."

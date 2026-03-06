@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use protocol::{
-    decode_exit, encode_exec_argv, encode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXEC,
+    decode_exit, encode_resize, ConsoleFrame, ExecSessionRequest, CONSOLE_DATA, CONSOLE_EXEC,
     CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL, STREAM_CONSOLE,
 };
 use std::io::{IsTerminal, Read};
@@ -8,29 +8,66 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncWriteExt;
 
-pub async fn run_console(conn: quinn::Connection) -> Result<()> {
-    let exit_code = run_session(conn, ConsoleFrame::new(CONSOLE_SHELL, vec![])).await?;
-    eprintln!("\r\nremote shell exited with {exit_code}");
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleSessionOutcome {
+    Exited(u32),
+    Disconnected,
 }
 
-pub async fn run_exec(conn: quinn::Connection, argv: Vec<String>) -> Result<u32> {
-    run_session(
-        conn,
-        ConsoleFrame::new(
-            CONSOLE_EXEC,
-            encode_exec_argv(&wrap_exec_with_term(argv, current_term_for_exec())),
-        ),
-    )
-    .await
+pub async fn run_console(conn: quinn::Connection) -> Result<ConsoleSessionOutcome> {
+    let outcome = run_session(conn, ConsoleFrame::new(CONSOLE_SHELL, vec![])).await?;
+    if let ConsoleSessionOutcome::Exited(exit_code) = outcome {
+        eprintln!("\r\nremote shell exited with {exit_code}");
+    }
+    Ok(outcome)
 }
 
-async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u32> {
-    let (mut send, mut recv) = conn.open_bi().await.context("open console stream")?;
-    send.write_u8(STREAM_CONSOLE)
-        .await
-        .context("write console stream tag")?;
-    startup.write_to(&mut send).await?;
+pub async fn run_exec(
+    conn: quinn::Connection,
+    request: ExecSessionRequest,
+) -> Result<ConsoleSessionOutcome> {
+    run_session(conn, ConsoleFrame::new(CONSOLE_EXEC, request.to_bytes())).await
+}
+
+pub fn build_exec_request(
+    session_id: String,
+    argv: Option<Vec<String>>,
+    context: Option<String>,
+) -> ExecSessionRequest {
+    ExecSessionRequest {
+        session_id,
+        argv: argv.map(|argv| wrap_exec_with_term(argv, current_term_for_exec())),
+        context,
+    }
+}
+
+async fn run_session(
+    conn: quinn::Connection,
+    startup: ConsoleFrame,
+) -> Result<ConsoleSessionOutcome> {
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(streams) => streams,
+        Err(err) => {
+            let err = anyhow::Error::new(err).context("open console stream");
+            if is_reconnectable_transport(&err) {
+                return Ok(ConsoleSessionOutcome::Disconnected);
+            }
+            return Err(err);
+        }
+    };
+    if let Err(err) = send.write_u8(STREAM_CONSOLE).await {
+        let err = anyhow::Error::new(err).context("write console stream tag");
+        if is_reconnectable_transport(&err) {
+            return Ok(ConsoleSessionOutcome::Disconnected);
+        }
+        return Err(err);
+    }
+    if let Err(err) = startup.write_to(&mut send).await {
+        if is_reconnectable_transport(&err) {
+            return Ok(ConsoleSessionOutcome::Disconnected);
+        }
+        return Err(err);
+    }
 
     let is_tty = std::io::stdin().is_terminal();
     let _raw_guard = if is_tty {
@@ -82,10 +119,16 @@ async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u
         Ok::<(), anyhow::Error>(())
     });
 
-    let exit_result: Result<u32> = async {
+    let session_result: Result<ConsoleSessionOutcome> = async {
         let mut stdout = tokio::io::stdout();
         loop {
-            let frame = ConsoleFrame::read_from(&mut recv).await?;
+            let frame = match ConsoleFrame::read_from(&mut recv).await {
+                Ok(frame) => frame,
+                Err(err) if is_reconnectable_transport(&err) => {
+                    return Ok(ConsoleSessionOutcome::Disconnected);
+                }
+                Err(err) => return Err(err),
+            };
             match frame.ty {
                 CONSOLE_DATA => {
                     stdout
@@ -95,7 +138,7 @@ async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u
                     stdout.flush().await.context("flush stdout")?;
                 }
                 CONSOLE_EXIT => {
-                    return decode_exit(&frame.payload);
+                    return Ok(ConsoleSessionOutcome::Exited(decode_exit(&frame.payload)?));
                 }
                 _ => {}
             }
@@ -116,10 +159,42 @@ async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u
         Err(err) if err.is_cancelled() => {}
         Err(err) => return Err(err).context("join resize task"),
     }
-    send_task.await.context("join send task")??;
+    let send_result = match send_task.await {
+        Ok(result) => result,
+        Err(err) => return Err(err).context("join send task"),
+    };
 
-    let exit_code = exit_result?;
-    Ok(exit_code)
+    match session_result {
+        Ok(ConsoleSessionOutcome::Exited(exit_code)) => {
+            send_result?;
+            Ok(ConsoleSessionOutcome::Exited(exit_code))
+        }
+        Ok(ConsoleSessionOutcome::Disconnected) => {
+            if let Err(err) = send_result {
+                if !is_reconnectable_transport(&err) {
+                    return Err(err);
+                }
+            }
+            Ok(ConsoleSessionOutcome::Disconnected)
+        }
+        Err(err) => {
+            if is_reconnectable_transport(&err) {
+                if let Err(send_err) = send_result {
+                    if !is_reconnectable_transport(&send_err) {
+                        return Err(send_err);
+                    }
+                }
+                Ok(ConsoleSessionOutcome::Disconnected)
+            } else {
+                if let Err(send_err) = send_result {
+                    if !is_reconnectable_transport(&send_err) {
+                        return Err(send_err);
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
 }
 
 fn current_term_for_exec() -> Option<String> {
@@ -296,9 +371,64 @@ fn try_read_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
     }
 }
 
+pub fn is_reconnectable_transport(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<quinn::ConnectionError>()
+            .is_some_and(is_reconnectable_connection_error)
+            || cause
+                .downcast_ref::<quinn::ReadError>()
+                .is_some_and(is_reconnectable_read_error)
+            || cause
+                .downcast_ref::<quinn::WriteError>()
+                .is_some_and(is_reconnectable_write_error)
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+    })
+}
+
+fn is_reconnectable_connection_error(err: &quinn::ConnectionError) -> bool {
+    matches!(
+        err,
+        quinn::ConnectionError::ApplicationClosed(_)
+            | quinn::ConnectionError::ConnectionClosed(_)
+            | quinn::ConnectionError::Reset
+            | quinn::ConnectionError::TimedOut
+            | quinn::ConnectionError::TransportError(_)
+    )
+}
+
+fn is_reconnectable_read_error(err: &quinn::ReadError) -> bool {
+    matches!(err, quinn::ReadError::Reset(_))
+        || matches!(
+            err,
+            quinn::ReadError::ConnectionLost(conn_err)
+                if is_reconnectable_connection_error(conn_err)
+        )
+}
+
+fn is_reconnectable_write_error(err: &quinn::WriteError) -> bool {
+    matches!(err, quinn::WriteError::Stopped(_))
+        || matches!(
+            err,
+            quinn::WriteError::ConnectionLost(conn_err)
+                if is_reconnectable_connection_error(conn_err)
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::wrap_exec_with_term;
+    use super::{is_reconnectable_transport, wrap_exec_with_term};
+    use anyhow::anyhow;
 
     #[test]
     fn wrap_exec_with_term_preserves_plain_exec_without_term() {
@@ -337,5 +467,11 @@ mod tests {
                 "svc".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn reconnectable_transport_matches_connection_reset_io_errors() {
+        let err = anyhow!(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(is_reconnectable_transport(&err));
     }
 }

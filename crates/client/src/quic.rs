@@ -6,10 +6,12 @@ use crate::proxy_udp::ProxyUdpSocket;
 use crate::{TransportConfig, VaultConfig};
 use anyhow::{anyhow, Context, Result};
 use protocol::{
-    AttestationPayload, ControlMessage, RootfsSource, SetupRequest, VmState, CHANNEL_BINDING_LABEL,
-    PROTOCOL_VERSION, STREAM_CONTROL,
+    AttestationPayload, ControlMessage, ExecSessionInfo, ExecSessionList, RootfsSource,
+    SetupRequest, VmState, CHANNEL_BINDING_LABEL, PROTOCOL_VERSION, STREAM_CONTROL,
+    STREAM_EXEC_LIST,
 };
 use quinn::{default_runtime, ClientConfig, Endpoint, EndpointConfig};
+use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
@@ -26,11 +28,10 @@ pub async fn connect_and_run(
     forwards: Vec<String>,
     reprovision: bool,
 ) -> Result<()> {
-    let conn = connect_ready(&cfg, reprovision).await?;
-
     if forwards.is_empty() {
-        console::run_console(conn).await?;
+        run_console_with_reconnect(&cfg, reprovision).await?;
     } else {
+        let conn = connect_ready(&cfg, reprovision).await?;
         let console_conn = conn.clone();
         tokio::spawn(async move {
             let _ = console::run_console(console_conn).await;
@@ -42,9 +43,99 @@ pub async fn connect_and_run(
     Ok(())
 }
 
-pub async fn connect_and_exec(cfg: VaultConfig, command: Vec<String>) -> Result<u32> {
+pub async fn connect_and_exec(
+    cfg: VaultConfig,
+    session: Option<String>,
+    context: Option<String>,
+    command: Vec<String>,
+) -> Result<u32> {
+    let session_id = session.unwrap_or_else(generate_exec_session_id);
+    let has_command = !command.is_empty();
+    eprintln!("exec session {session_id}");
+    let request = console::build_exec_request(
+        session_id,
+        if has_command { Some(command) } else { None },
+        if has_command { context } else { None },
+    );
+    run_exec_with_reconnect(&cfg, request).await
+}
+
+pub async fn list_exec_sessions(cfg: VaultConfig) -> Result<Vec<ExecSessionInfo>> {
     let conn = connect_ready(&cfg, false).await?;
-    console::run_exec(conn, command).await
+    let (mut send, mut recv) = conn.open_bi().await.context("open exec-list stream")?;
+    send.write_u8(STREAM_EXEC_LIST)
+        .await
+        .context("write exec-list stream tag")?;
+    send.finish().context("finish exec-list request")?;
+    let list = ExecSessionList::read_from(&mut recv).await?;
+    Ok(list.sessions)
+}
+
+async fn run_console_with_reconnect(cfg: &VaultConfig, reprovision: bool) -> Result<()> {
+    let mut reprovision = reprovision;
+    let mut connected_once = false;
+
+    loop {
+        let conn = match connect_ready(cfg, reprovision).await {
+            Ok(conn) => conn,
+            Err(err) if connected_once && console::is_reconnectable_transport(&err) => {
+                warn!(error = ?err, "console reconnect failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        connected_once = true;
+        reprovision = false;
+
+        match console::run_console(conn).await? {
+            console::ConsoleSessionOutcome::Exited(_) => return Ok(()),
+            console::ConsoleSessionOutcome::Disconnected => {
+                warn!("console connection lost; reconnecting");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn run_exec_with_reconnect(
+    cfg: &VaultConfig,
+    request: protocol::ExecSessionRequest,
+) -> Result<u32> {
+    let mut connected_once = false;
+
+    loop {
+        let conn = match connect_ready(cfg, false).await {
+            Ok(conn) => conn,
+            Err(err) if connected_once && console::is_reconnectable_transport(&err) => {
+                warn!(
+                    error = ?err,
+                    session_id = %request.session_id,
+                    "exec reconnect failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        connected_once = true;
+        match console::run_exec(conn, request.clone()).await? {
+            console::ConsoleSessionOutcome::Exited(exit_code) => return Ok(exit_code),
+            console::ConsoleSessionOutcome::Disconnected => {
+                warn!(
+                    session_id = %request.session_id,
+                    "exec connection lost; reconnecting"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+fn generate_exec_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Connection> {

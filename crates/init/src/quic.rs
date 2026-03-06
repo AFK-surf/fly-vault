@@ -4,7 +4,7 @@ use crate::{Args, SharedState};
 use anyhow::{anyhow, Context, Result};
 use protocol::{
     AttestationPayload, ControlMessage, RootfsSource, SetupRequest, VmState, CHANNEL_BINDING_LABEL,
-    PROTOCOL_VERSION, STREAM_CONSOLE, STREAM_CONTROL, STREAM_PORT_FORWARD,
+    PROTOCOL_VERSION, STREAM_CONSOLE, STREAM_CONTROL, STREAM_EXEC_LIST, STREAM_PORT_FORWARD,
 };
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, ServerConfig};
 use std::net::SocketAddr;
@@ -113,7 +113,7 @@ async fn handle_connection(
                 let _ = send.reset(quinn::VarInt::from_u32(1));
             }
             STREAM_CONSOLE => {
-                let (root_dir, inner_pid) = {
+                let (console, exec_sessions, root_dir, inner_pid) = {
                     let mut guard = shared.lock().await;
                     let inner_pid = match guard.setup.ensure_live_inner_init_pid() {
                         Ok(pid) => pid,
@@ -123,13 +123,40 @@ async fn handle_connection(
                             continue;
                         }
                     };
-                    (guard.setup.root_mount_dir().to_path_buf(), inner_pid)
+                    (
+                        Arc::clone(&guard.console),
+                        Arc::clone(&guard.exec_sessions),
+                        guard.setup.root_mount_dir().to_path_buf(),
+                        inner_pid,
+                    )
                 };
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        forward::handle_console_stream(send, recv, &root_dir, inner_pid).await
+                    if let Err(err) = forward::handle_console_stream(
+                        send,
+                        recv,
+                        console,
+                        exec_sessions,
+                        &root_dir,
+                        inner_pid,
+                    )
+                    .await
                     {
                         warn!(error = ?err, "console stream failed");
+                    }
+                });
+            }
+            STREAM_EXEC_LIST if !authenticated => {
+                warn!("rejecting unauthenticated exec-list stream");
+                let _ = send.reset(quinn::VarInt::from_u32(1));
+            }
+            STREAM_EXEC_LIST => {
+                let exec_sessions = {
+                    let guard = shared.lock().await;
+                    Arc::clone(&guard.exec_sessions)
+                };
+                tokio::spawn(async move {
+                    if let Err(err) = forward::handle_exec_list_stream(send, exec_sessions).await {
+                        warn!(error = ?err, "exec-list stream failed");
                     }
                 });
             }

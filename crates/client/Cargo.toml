@@ -14,6 +14,7 @@ http.workspace = true
 jsonwebtoken.workspace = true
 protocol = { path = "../protocol" }
 quinn.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

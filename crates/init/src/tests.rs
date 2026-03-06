@@ -3,8 +3,9 @@ use anyhow::{anyhow, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use protocol::{
-    AttestationPayload, ControlMessage, RootfsSource, RuntimeStatus, SetupRequest, VmState,
-    PROTOCOL_VERSION, STREAM_CONTROL,
+    AttestationPayload, ConsoleFrame, ControlMessage, ExecSessionList, ExecSessionRequest,
+    RootfsSource, RuntimeStatus, SetupRequest, VmState, CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_SHELL,
+    PROTOCOL_VERSION, STREAM_CONSOLE, STREAM_CONTROL, STREAM_EXEC_LIST,
 };
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -186,6 +187,147 @@ async fn cold_boot_to_ready_and_reconnect() -> Result<()> {
 
     server.abort();
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_connect_shell_survives_connection_reconnect() -> Result<()> {
+    let temp = TempDir::new().context("create temp dir")?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
+    let args = args_for_test(&temp, port)?;
+    let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
+    let server = tokio::spawn(quic::serve(args.clone(), shared));
+
+    let endpoint = test_endpoint()?;
+    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+
+    let conn1 = connect_with_retry(&endpoint, addr).await?;
+    provision_cold(
+        &conn1,
+        "test-access-token",
+        ControlRootfs::Inline(test_rootfs("shared-console")?),
+    )
+    .await?;
+
+    let marker = "shared-shell-marker-12345";
+    let (mut console_send1, mut console_recv1) = open_console_shell_stream(&conn1).await?;
+    send_console_input(
+        &mut console_send1,
+        &format!("export FLY_VAULT_SHARED_MARKER={marker}\n"),
+    )
+    .await?;
+    send_console_input(&mut console_send1, "printf '__READY1__\\n'\n").await?;
+    read_console_until(&mut console_recv1, "__READY1__").await?;
+    drop(console_send1);
+    drop(console_recv1);
+    drop(conn1);
+
+    let conn2 = ready_connection(&endpoint, addr, "test-access-token").await?;
+    let (mut console_send2, mut console_recv2) = open_console_shell_stream(&conn2).await?;
+    send_console_input(
+        &mut console_send2,
+        "printf '%s\\n' \"$FLY_VAULT_SHARED_MARKER\"\nprintf '__READY2__\\n'\n",
+    )
+    .await?;
+    let output = read_console_until(&mut console_recv2, "__READY2__").await?;
+    assert!(
+        output.contains(marker),
+        "expected shared shell env var to persist across reconnect, got: {output}"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_session_survives_connection_reconnect_and_lists() -> Result<()> {
+    let temp = TempDir::new().context("create temp dir")?;
+    let Some(port) = choose_udp_port()? else {
+        return Ok(());
+    };
+    let args = args_for_test(&temp, port)?;
+    let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
+    let server = tokio::spawn(quic::serve(args.clone(), shared));
+
+    let endpoint = test_endpoint()?;
+    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+
+    let conn1 = connect_with_retry(&endpoint, addr).await?;
+    provision_cold(
+        &conn1,
+        "test-access-token",
+        ControlRootfs::Inline(test_rootfs("exec-session")?),
+    )
+    .await?;
+
+    let session_id = "exec-session-1";
+    let (exec_send1, mut exec_recv1) = open_exec_session_stream(
+        &conn1,
+        ExecSessionRequest {
+            session_id: session_id.to_string(),
+            argv: Some(vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "echo started; read line; echo again:$line".to_string(),
+            ]),
+            context: Some("debugging a stuck deploy".to_string()),
+        },
+    )
+    .await?;
+    read_console_until(&mut exec_recv1, "started").await?;
+    drop(exec_send1);
+    drop(exec_recv1);
+    drop(conn1);
+
+    let conn2 = ready_connection(&endpoint, addr, "test-access-token").await?;
+    let sessions = list_exec_sessions(&conn2).await?;
+    let session = sessions
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .context("find exec session in list")?;
+    assert_eq!(
+        session.argv,
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "echo started; read line; echo again:$line".to_string(),
+        ]
+    );
+    assert_eq!(session.context.as_deref(), Some("debugging a stuck deploy"));
+    assert!(!session.attached);
+    assert_eq!(session.exit_code, None);
+
+    let (mut exec_send2, mut exec_recv2) = open_exec_session_stream(
+        &conn2,
+        ExecSessionRequest {
+            session_id: session_id.to_string(),
+            argv: None,
+            context: None,
+        },
+    )
+    .await?;
+    send_console_input(&mut exec_send2, "hello\n").await?;
+    let output = read_console_until(&mut exec_recv2, "again:hello").await?;
+    assert!(output.contains("again:hello"));
+    wait_for_console_exit(&mut exec_recv2).await?;
+
+    for _ in 0..20 {
+        let sessions = list_exec_sessions(&conn2).await?;
+        if sessions
+            .sessions
+            .iter()
+            .all(|session| session.session_id != session_id)
+        {
+            server.abort();
+            return Ok(());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    return Err(anyhow!(
+        "exec session {session_id} was not removed after exit"
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -443,6 +585,8 @@ async fn shared_state_for_args(
         vm_state,
         setup,
         access_token,
+        console: Arc::new(forward::SharedConsoleManager::new()),
+        exec_sessions: Arc::new(forward::ExecSessionManager::new()),
     })))
 }
 
@@ -452,6 +596,93 @@ async fn open_control_stream(conn: &Connection) -> Result<(quinn::SendStream, qu
         .await
         .context("write control stream tag")?;
     Ok((send, recv))
+}
+
+async fn ready_connection(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    token: &str,
+) -> Result<Connection> {
+    let conn = connect_with_retry(endpoint, addr).await?;
+    let (mut send, mut recv) = open_control_stream(&conn).await?;
+    let attestation = request_attestation(&mut send, &mut recv).await?;
+    assert_eq!(attestation.state, VmState::Ready);
+    send_setup_request(&mut send, token, RootfsSource::None).await?;
+    wait_setup_complete(&mut recv).await?;
+    Ok(conn)
+}
+
+async fn open_console_shell_stream(
+    conn: &Connection,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    let (mut send, recv) = conn.open_bi().await.context("open console stream")?;
+    send.write_u8(STREAM_CONSOLE)
+        .await
+        .context("write console stream tag")?;
+    ConsoleFrame::new(CONSOLE_SHELL, vec![])
+        .write_to(&mut send)
+        .await
+        .context("send console shell startup")?;
+    Ok((send, recv))
+}
+
+async fn open_exec_session_stream(
+    conn: &Connection,
+    request: ExecSessionRequest,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    let (mut send, recv) = conn.open_bi().await.context("open exec console stream")?;
+    send.write_u8(STREAM_CONSOLE)
+        .await
+        .context("write exec console stream tag")?;
+    ConsoleFrame::new(CONSOLE_EXEC, request.to_bytes())
+        .write_to(&mut send)
+        .await
+        .context("send exec session startup")?;
+    Ok((send, recv))
+}
+
+async fn list_exec_sessions(conn: &Connection) -> Result<ExecSessionList> {
+    let (mut send, mut recv) = conn.open_bi().await.context("open exec-list stream")?;
+    send.write_u8(STREAM_EXEC_LIST)
+        .await
+        .context("write exec-list stream tag")?;
+    send.finish().context("finish exec-list request")?;
+    ExecSessionList::read_from(&mut recv).await
+}
+
+async fn send_console_input(send: &mut quinn::SendStream, input: &str) -> Result<()> {
+    ConsoleFrame::new(CONSOLE_DATA, input.as_bytes().to_vec())
+        .write_to(send)
+        .await
+        .with_context(|| format!("send console input {:?}", input))
+}
+
+async fn read_console_until(recv: &mut quinn::RecvStream, needle: &str) -> Result<String> {
+    let mut out = Vec::new();
+    for _ in 0..200 {
+        let frame = tokio::time::timeout(Duration::from_millis(250), ConsoleFrame::read_from(recv))
+            .await
+            .context("timed out waiting for console output")??;
+        if frame.ty == CONSOLE_DATA {
+            out.extend_from_slice(&frame.payload);
+            let text = String::from_utf8_lossy(&out);
+            if text.contains(needle) {
+                return Ok(text.into_owned());
+            }
+        }
+    }
+    Err(anyhow!("console output did not contain marker {needle}"))
+}
+
+async fn wait_for_console_exit(recv: &mut quinn::RecvStream) -> Result<u32> {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_millis(250), ConsoleFrame::read_from(recv))
+            .await
+            .context("timed out waiting for console exit")??;
+        if frame.ty == protocol::CONSOLE_EXIT {
+            return protocol::decode_exit(&frame.payload);
+        }
+    }
 }
 
 async fn request_attestation(

@@ -9,6 +9,7 @@ pub const CHANNEL_BINDING_LABEL: &str = "fly-vault-channel-binding";
 pub const STREAM_CONTROL: u8 = 0x01;
 pub const STREAM_PORT_FORWARD: u8 = 0x02;
 pub const STREAM_CONSOLE: u8 = 0x03;
+pub const STREAM_EXEC_LIST: u8 = 0x04;
 
 pub const CONTROL_REQUEST_ATTESTATION: u8 = 0x01;
 pub const CONTROL_ATTESTATION: u8 = 0x02;
@@ -404,6 +405,242 @@ pub fn decode_exec_argv(mut data: &[u8]) -> Result<Vec<String>> {
     Ok(argv)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecSessionRequest {
+    pub session_id: String,
+    pub argv: Option<Vec<String>>,
+    pub context: Option<String>,
+}
+
+impl ExecSessionRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        out.put_u32(self.session_id.len() as u32);
+        out.extend_from_slice(self.session_id.as_bytes());
+        match &self.argv {
+            Some(argv) => {
+                out.put_u8(1);
+                let argv = encode_exec_argv(argv);
+                out.put_u32(argv.len() as u32);
+                out.extend_from_slice(&argv);
+            }
+            None => out.put_u8(0),
+        }
+        match &self.context {
+            Some(context) => {
+                out.put_u8(1);
+                out.put_u32(context.len() as u32);
+                out.extend_from_slice(context.as_bytes());
+            }
+            None => out.put_u8(0),
+        }
+        out.to_vec()
+    }
+
+    pub fn from_bytes(mut data: &[u8]) -> Result<Self> {
+        let session_id = take_len_prefixed(&mut data, "exec session id")?;
+        let session_id =
+            String::from_utf8(session_id.to_vec()).context("exec session id not utf-8")?;
+        if session_id.is_empty() {
+            return Err(anyhow!("exec session id must not be empty"));
+        }
+        if !data.has_remaining() {
+            return Err(anyhow!("exec session payload missing argv flag"));
+        }
+        let has_argv = data.get_u8();
+        let argv = match has_argv {
+            0 => None,
+            1 => {
+                let argv = take_len_prefixed(&mut data, "exec session argv")?;
+                Some(decode_exec_argv(argv)?)
+            }
+            other => return Err(anyhow!("invalid exec session argv flag: {other}")),
+        };
+        if !data.has_remaining() {
+            return Ok(Self {
+                session_id,
+                argv,
+                context: None,
+            });
+        }
+        let has_context = data.get_u8();
+        let context = match has_context {
+            0 => None,
+            1 => {
+                let payload = take_len_prefixed(&mut data, "exec session context")?;
+                Some(
+                    String::from_utf8(payload.to_vec())
+                        .context("exec session context not utf-8")?,
+                )
+            }
+            other => return Err(anyhow!("invalid exec session context flag: {other}")),
+        };
+        if data.has_remaining() {
+            return Err(anyhow!("exec session payload has trailing bytes"));
+        }
+        Ok(Self {
+            session_id,
+            argv,
+            context,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecSessionInfo {
+    pub session_id: String,
+    pub argv: Vec<String>,
+    pub context: Option<String>,
+    pub attached: bool,
+    pub exit_code: Option<u32>,
+}
+
+impl ExecSessionInfo {
+    fn encode(&self, out: &mut BytesMut) {
+        out.put_u32(self.session_id.len() as u32);
+        out.extend_from_slice(self.session_id.as_bytes());
+        out.put_u8(u8::from(self.attached));
+        match self.exit_code {
+            Some(code) => {
+                out.put_u8(1);
+                out.put_u32(code);
+            }
+            None => out.put_u8(0),
+        }
+        let argv = encode_exec_argv(&self.argv);
+        out.put_u32(argv.len() as u32);
+        out.extend_from_slice(&argv);
+        match &self.context {
+            Some(context) => {
+                out.put_u8(1);
+                out.put_u32(context.len() as u32);
+                out.extend_from_slice(context.as_bytes());
+            }
+            None => out.put_u8(0),
+        }
+    }
+
+    fn decode(data: &mut &[u8]) -> Result<Self> {
+        let session_id = take_len_prefixed(data, "exec session info id")?;
+        let session_id =
+            String::from_utf8(session_id.to_vec()).context("exec session info id not utf-8")?;
+        if session_id.is_empty() {
+            return Err(anyhow!("exec session info id must not be empty"));
+        }
+        if data.remaining() < 2 {
+            return Err(anyhow!("exec session info payload too short"));
+        }
+        let attached = match data.get_u8() {
+            0 => false,
+            1 => true,
+            other => return Err(anyhow!("invalid exec session attached flag: {other}")),
+        };
+        let exit_code = match data.get_u8() {
+            0 => None,
+            1 => {
+                if data.remaining() < 4 {
+                    return Err(anyhow!("exec session exit code truncated"));
+                }
+                Some(data.get_u32())
+            }
+            other => return Err(anyhow!("invalid exec session exit flag: {other}")),
+        };
+        let argv = take_len_prefixed(data, "exec session argv")?;
+        let argv = decode_exec_argv(argv)?;
+        if !data.has_remaining() {
+            return Ok(Self {
+                session_id,
+                argv,
+                context: None,
+                attached,
+                exit_code,
+            });
+        }
+        let context = match data.get_u8() {
+            0 => None,
+            1 => {
+                let payload = take_len_prefixed(data, "exec session context")?;
+                Some(
+                    String::from_utf8(payload.to_vec())
+                        .context("exec session context not utf-8")?,
+                )
+            }
+            other => return Err(anyhow!("invalid exec session context flag: {other}")),
+        };
+        Ok(Self {
+            session_id,
+            argv,
+            context,
+            attached,
+            exit_code,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecSessionList {
+    pub sessions: Vec<ExecSessionInfo>,
+}
+
+impl ExecSessionList {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        out.put_u32(self.sessions.len() as u32);
+        for session in &self.sessions {
+            session.encode(&mut out);
+        }
+        out.to_vec()
+    }
+
+    pub fn from_bytes(mut data: &[u8]) -> Result<Self> {
+        if data.remaining() < 4 {
+            return Err(anyhow!("exec session list payload too short"));
+        }
+        let count = data.get_u32() as usize;
+        let mut sessions = Vec::with_capacity(count);
+        for _ in 0..count {
+            sessions.push(ExecSessionInfo::decode(&mut data)?);
+        }
+        if data.has_remaining() {
+            return Err(anyhow!("exec session list payload has trailing bytes"));
+        }
+        Ok(Self { sessions })
+    }
+
+    pub async fn read_from<R>(reader: &mut R) -> Result<Self>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let len = reader
+            .read_u32()
+            .await
+            .context("read exec session list length")?;
+        let mut payload = vec![0u8; len as usize];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .context("read exec session list payload")?;
+        Self::from_bytes(&payload)
+    }
+
+    pub async fn write_to<W>(&self, writer: &mut W) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let payload = self.to_bytes();
+        writer
+            .write_u32(payload.len() as u32)
+            .await
+            .context("write exec session list length")?;
+        writer
+            .write_all(&payload)
+            .await
+            .context("write exec session list payload")?;
+        writer.flush().await.context("flush exec session list")?;
+        Ok(())
+    }
+}
+
 pub fn encode_proxy_machine_header(machine_id: &str) -> Result<Vec<u8>> {
     if machine_id.is_empty() {
         return Err(anyhow!("machine_id must not be empty"));
@@ -464,7 +701,8 @@ fn take_len_prefixed<'a>(bytes: &mut &'a [u8], label: &str) -> Result<&'a [u8]> 
 mod tests {
     use super::{
         decode_exec_argv, decode_proxy_packet, encode_exec_argv, encode_proxy_machine_header,
-        AttestationPayload, RootfsSource, RuntimeStatus, SetupRequest, VmState, PROTOCOL_VERSION,
+        AttestationPayload, ExecSessionInfo, ExecSessionList, ExecSessionRequest, RootfsSource,
+        RuntimeStatus, SetupRequest, VmState, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -518,5 +756,41 @@ mod tests {
         let decoded = decode_proxy_packet(&packet).unwrap();
         assert_eq!(decoded.machine_id, "machine-123");
         assert_eq!(decoded.payload, b"payload");
+    }
+
+    #[test]
+    fn exec_session_request_round_trips() {
+        let request = ExecSessionRequest {
+            session_id: "sess-123".to_string(),
+            argv: Some(vec!["ls".to_string(), "-l".to_string()]),
+            context: Some("investigate deploy failure".to_string()),
+        };
+        assert_eq!(
+            ExecSessionRequest::from_bytes(&request.to_bytes()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn exec_session_list_round_trips() {
+        let list = ExecSessionList {
+            sessions: vec![
+                ExecSessionInfo {
+                    session_id: "sess-running".to_string(),
+                    argv: vec!["bash".to_string()],
+                    context: Some("live debugging".to_string()),
+                    attached: true,
+                    exit_code: None,
+                },
+                ExecSessionInfo {
+                    session_id: "sess-exited".to_string(),
+                    argv: vec!["echo".to_string(), "hi".to_string()],
+                    context: None,
+                    attached: false,
+                    exit_code: Some(7),
+                },
+            ],
+        };
+        assert_eq!(ExecSessionList::from_bytes(&list.to_bytes()).unwrap(), list);
     }
 }

@@ -39,6 +39,8 @@ pub struct SharedState {
     pub vm_state: VmState,
     pub setup: setup::SetupManager,
     pub access_token: Option<String>,
+    pub console: Arc<forward::SharedConsoleManager>,
+    pub exec_sessions: Arc<forward::ExecSessionManager>,
 }
 
 #[tokio::main]
@@ -83,6 +85,8 @@ async fn main() -> anyhow::Result<()> {
         vm_state: initial_state,
         setup,
         access_token,
+        console: Arc::new(forward::SharedConsoleManager::new()),
+        exec_sessions: Arc::new(forward::ExecSessionManager::new()),
     }));
 
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;

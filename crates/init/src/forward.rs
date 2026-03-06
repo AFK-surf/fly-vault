@@ -1,17 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use nix::unistd::Pid;
 use protocol::{
-    decode_exec_argv, decode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_EXIT,
-    CONSOLE_RESIZE, CONSOLE_SHELL,
+    decode_resize, ConsoleFrame, ExecSessionInfo, ExecSessionList, ExecSessionRequest,
+    CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL,
 };
-use std::future::Future;
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 pub async fn handle_port_forward_stream(
     mut send: quinn::SendStream,
@@ -66,117 +70,640 @@ pub async fn handle_port_forward_stream(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+pub struct SharedConsoleManager {
+    session: Mutex<Option<Arc<SharedConsoleSession>>>,
+}
+
+impl SharedConsoleManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn attach(&self, root_dir: &Path, inner_pid: Pid) -> Result<SharedConsoleAttachment> {
+        loop {
+            let session = {
+                let mut guard = self.session.lock().await;
+                match guard.as_ref() {
+                    Some(existing) if !existing.is_finished() => Arc::clone(existing),
+                    _ => {
+                        let session = Arc::new(SharedConsoleSession::spawn(root_dir, inner_pid)?);
+                        *guard = Some(Arc::clone(&session));
+                        session
+                    }
+                }
+            };
+
+            let attachment = session.attach();
+            if !session.is_finished() {
+                return Ok(attachment);
+            }
+
+            let mut guard = self.session.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                *guard = None;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ExecSessionManager {
+    sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
+}
+
+impl ExecSessionManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn attach_or_create(
+        self: &Arc<Self>,
+        root_dir: &Path,
+        inner_pid: Pid,
+        request: ExecSessionRequest,
+    ) -> Result<ExecSessionAttachment> {
+        let session = {
+            let mut guard = self.sessions.lock().await;
+            if let Some(existing) = guard.get(&request.session_id) {
+                Arc::clone(existing)
+            } else {
+                let argv = request
+                    .argv
+                    .clone()
+                    .ok_or_else(|| anyhow!("exec session {} not found", request.session_id))?;
+                if argv.is_empty() {
+                    return Err(anyhow!(
+                        "exec request must include at least one argv element"
+                    ));
+                }
+                let session = Arc::new(ExecSession::spawn(
+                    root_dir,
+                    inner_pid,
+                    request.session_id.clone(),
+                    argv,
+                    request.context.clone(),
+                    Arc::downgrade(self),
+                )?);
+                guard.insert(request.session_id.clone(), Arc::clone(&session));
+                session
+            }
+        };
+
+        session.attach().await
+    }
+
+    pub async fn list(&self) -> Vec<ExecSessionInfo> {
+        let sessions = {
+            let guard = self.sessions.lock().await;
+            let mut sessions = guard.values().cloned().collect::<Vec<_>>();
+            sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+            sessions
+        };
+
+        let mut out = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            out.push(session.snapshot().await);
+        }
+        out
+    }
+
+    async fn remove_if_same(&self, session_id: &str, session: &Arc<ExecSession>) {
+        let mut guard = self.sessions.lock().await;
+        if guard
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            guard.remove(session_id);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SharedConsoleSession {
+    runtime: PersistentConsoleRuntime,
+}
+
+impl SharedConsoleSession {
+    fn spawn(root_dir: &Path, inner_pid: Pid) -> Result<Self> {
+        Ok(Self {
+            runtime: spawn_persistent_console(
+                ConsoleLaunch::Shell,
+                root_dir,
+                inner_pid,
+                "shared console shell",
+                None,
+            )?,
+        })
+    }
+
+    fn attach(&self) -> SharedConsoleAttachment {
+        SharedConsoleAttachment {
+            input_tx: self.runtime.input_tx.clone(),
+            output_rx: self.runtime.output_tx.subscribe(),
+            exit_code: Arc::clone(&self.runtime.exit_code),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        read_exit_code(self.runtime.exit_code.as_ref()).is_some()
+    }
+}
+
+#[derive(Debug)]
+struct ExecSession {
+    session_id: String,
+    argv: Vec<String>,
+    context: Option<String>,
+    runtime: PersistentConsoleRuntime,
+    attachment: Mutex<ExecAttachmentState>,
+}
+
+impl ExecSession {
+    fn spawn(
+        root_dir: &Path,
+        inner_pid: Pid,
+        session_id: String,
+        argv: Vec<String>,
+        context: Option<String>,
+        owner: std::sync::Weak<ExecSessionManager>,
+    ) -> Result<Self> {
+        Ok(Self {
+            session_id: session_id.clone(),
+            argv: argv.clone(),
+            context,
+            runtime: spawn_persistent_console(
+                ConsoleLaunch::Exec(argv),
+                root_dir,
+                inner_pid,
+                "persistent exec session",
+                Some(ExecSessionCleanup { owner, session_id }),
+            )?,
+            attachment: Mutex::new(ExecAttachmentState::default()),
+        })
+    }
+
+    async fn attach(self: &Arc<Self>) -> Result<ExecSessionAttachment> {
+        let mut state = self.attachment.lock().await;
+        if let Some((_, token)) = state.current.take() {
+            token.cancel();
+        }
+        state.next_generation += 1;
+        let generation = state.next_generation;
+        let takeover = CancellationToken::new();
+        state.current = Some((generation, takeover.clone()));
+
+        Ok(ExecSessionAttachment {
+            session: Arc::clone(self),
+            input_tx: self.runtime.input_tx.clone(),
+            output_rx: self.runtime.output_tx.subscribe(),
+            exit_code: Arc::clone(&self.runtime.exit_code),
+            takeover,
+            generation,
+        })
+    }
+
+    async fn detach(&self, generation: u64) {
+        let mut state = self.attachment.lock().await;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            state.current = None;
+        }
+    }
+
+    async fn snapshot(&self) -> ExecSessionInfo {
+        let attached = {
+            let state = self.attachment.lock().await;
+            state.current.is_some() && read_exit_code(self.runtime.exit_code.as_ref()).is_none()
+        };
+        ExecSessionInfo {
+            session_id: self.session_id.clone(),
+            argv: self.argv.clone(),
+            context: self.context.clone(),
+            attached,
+            exit_code: read_exit_code(self.runtime.exit_code.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExecAttachmentState {
+    next_generation: u64,
+    current: Option<(u64, CancellationToken)>,
+}
+
+#[derive(Debug)]
+struct PersistentConsoleRuntime {
+    input_tx: mpsc::Sender<ConsoleInput>,
+    output_tx: broadcast::Sender<ConsoleFrame>,
+    exit_code: Arc<StdMutex<Option<u32>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ExecSessionCleanup {
+    owner: std::sync::Weak<ExecSessionManager>,
+    session_id: String,
+}
+
+#[derive(Debug)]
+pub struct SharedConsoleAttachment {
+    input_tx: mpsc::Sender<ConsoleInput>,
+    output_rx: broadcast::Receiver<ConsoleFrame>,
+    exit_code: Arc<StdMutex<Option<u32>>>,
+}
+
+#[derive(Debug)]
+pub struct ExecSessionAttachment {
+    session: Arc<ExecSession>,
+    input_tx: mpsc::Sender<ConsoleInput>,
+    output_rx: broadcast::Receiver<ConsoleFrame>,
+    exit_code: Arc<StdMutex<Option<u32>>>,
+    takeover: CancellationToken,
+    generation: u64,
+}
+
+#[derive(Debug)]
+enum ConsoleInput {
+    Data(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+}
+
 pub async fn handle_console_stream(
-    mut send: quinn::SendStream,
+    send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    shared_console: Arc<SharedConsoleManager>,
+    exec_sessions: Arc<ExecSessionManager>,
     root_dir: &Path,
     inner_pid: Pid,
 ) -> Result<()> {
-    let launch = match ConsoleFrame::read_from(&mut recv).await? {
-        ConsoleFrame {
-            ty: CONSOLE_SHELL, ..
-        } => ConsoleLaunch::Shell,
-        ConsoleFrame {
-            ty: CONSOLE_EXEC,
-            payload,
-        } => {
-            let argv = decode_exec_argv(&payload)?;
-            if argv.is_empty() {
-                return Err(anyhow!(
-                    "exec request must include at least one argv element"
-                ));
+    let startup = ConsoleFrame::read_from(&mut recv).await?;
+
+    match startup.ty {
+        CONSOLE_SHELL => {
+            handle_shared_console_stream(send, recv, shared_console, root_dir, inner_pid).await
+        }
+        CONSOLE_EXEC => {
+            let request = ExecSessionRequest::from_bytes(&startup.payload)?;
+            handle_exec_session_stream(send, recv, exec_sessions, root_dir, inner_pid, request)
+                .await
+        }
+        other => Err(anyhow!("unexpected initial console frame type: {other}")),
+    }
+}
+
+pub async fn handle_exec_list_stream(
+    mut send: quinn::SendStream,
+    exec_sessions: Arc<ExecSessionManager>,
+) -> Result<()> {
+    let list = ExecSessionList {
+        sessions: exec_sessions.list().await,
+    };
+    list.write_to(&mut send).await?;
+    send.finish().context("finish exec-list stream")?;
+    Ok(())
+}
+
+async fn handle_shared_console_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    shared_console: Arc<SharedConsoleManager>,
+    root_dir: &Path,
+    inner_pid: Pid,
+) -> Result<()> {
+    let SharedConsoleAttachment {
+        input_tx,
+        mut output_rx,
+        exit_code,
+    } = shared_console.attach(root_dir, inner_pid).await?;
+
+    let session_to_client = async {
+        loop {
+            match output_rx.recv().await {
+                Ok(frame) => {
+                    let is_exit = frame.ty == CONSOLE_EXIT;
+                    frame.write_to(&mut send).await?;
+                    if is_exit {
+                        send.finish().context("finish shared console stream")?;
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if let Some(code) = read_exit_code(exit_code.as_ref()) {
+                        write_exit_frame(&mut send, code).await?;
+                        send.finish()
+                            .context("finish lagged shared console stream")?;
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    if let Some(code) = read_exit_code(exit_code.as_ref()) {
+                        write_exit_frame(&mut send, code).await?;
+                        send.finish()
+                            .context("finish closed shared console stream")?;
+                    }
+                    break;
+                }
             }
-            ConsoleLaunch::Exec(argv)
         }
-        frame => {
-            return Err(anyhow!(
-                "unexpected initial console frame type: {}",
-                frame.ty
-            ));
-        }
+        Ok::<(), anyhow::Error>(())
     };
 
+    let client_to_session = async { relay_client_input(&mut recv, &input_tx, None).await };
+
+    tokio::select! {
+        result = session_to_client => result?,
+        result = client_to_session => result?,
+    }
+
+    Ok(())
+}
+
+async fn handle_exec_session_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    exec_sessions: Arc<ExecSessionManager>,
+    root_dir: &Path,
+    inner_pid: Pid,
+    request: ExecSessionRequest,
+) -> Result<()> {
+    let ExecSessionAttachment {
+        session,
+        input_tx,
+        mut output_rx,
+        exit_code,
+        takeover,
+        generation,
+    } = exec_sessions
+        .attach_or_create(root_dir, inner_pid, request)
+        .await?;
+
+    let session_to_client = async {
+        if let Some(code) = read_exit_code(exit_code.as_ref()) {
+            write_exit_frame(&mut send, code).await?;
+            send.finish().context("finish exited exec session stream")?;
+            return Ok::<(), anyhow::Error>(());
+        }
+
+        loop {
+            tokio::select! {
+                _ = takeover.cancelled() => break,
+                result = output_rx.recv() => {
+                    match result {
+                        Ok(frame) => {
+                            let is_exit = frame.ty == CONSOLE_EXIT;
+                            frame.write_to(&mut send).await?;
+                            if is_exit {
+                                send.finish().context("finish exec session stream")?;
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if let Some(code) = read_exit_code(exit_code.as_ref()) {
+                                write_exit_frame(&mut send, code).await?;
+                                send.finish().context("finish lagged exec session stream")?;
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            if let Some(code) = read_exit_code(exit_code.as_ref()) {
+                                write_exit_frame(&mut send, code).await?;
+                                send.finish().context("finish closed exec session stream")?;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let client_to_session =
+        async { relay_client_input(&mut recv, &input_tx, Some(&takeover)).await };
+
+    let result = tokio::select! {
+        result = session_to_client => result,
+        result = client_to_session => result,
+    };
+
+    session.detach(generation).await;
+    result?;
+    Ok(())
+}
+
+fn spawn_persistent_console(
+    launch: ConsoleLaunch,
+    root_dir: &Path,
+    inner_pid: Pid,
+    wait_label: &'static str,
+    cleanup: Option<ExecSessionCleanup>,
+) -> Result<PersistentConsoleRuntime> {
     let (master_fd, slave_fd) = open_pty().context("allocate pty pair")?;
 
-    // Spawn the requested program with the slave side as its controlling terminal.
-    // When an inner init is running in PID+mount namespaces, use nsenter to
-    // join those namespaces so the console sees the same /proc and mounts.
     let mut cmd = build_console_command(&launch, root_dir, inner_pid);
     configure_console_stdio(&mut cmd, &slave_fd)?;
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| launch.spawn_context(inner_pid))?;
 
-    // Close slave in parent — the child has its own copies.
     drop(slave_fd);
 
-    // Prepare async I/O on the master side. Keep the master in a narrow scope so
-    // any client/PTTY teardown drops it before we wait on the shell again.
     set_nonblocking(&master_fd)?;
-    let termination = {
-        let master = AsyncFd::new(master_fd).context("wrap pty master in AsyncFd")?;
+    let master = Arc::new(AsyncFd::new(master_fd).context("wrap pty master in AsyncFd")?);
 
-        let from_pty = async {
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = pty_read(&master, &mut buf).await?;
-                if n == 0 {
+    let (input_tx, input_rx) = mpsc::channel(64);
+    let (output_tx, _) = broadcast::channel(128);
+    let exit_code = Arc::new(StdMutex::new(None));
+    let shutdown = CancellationToken::new();
+
+    tokio::spawn(run_persistent_console_input(
+        Arc::clone(&master),
+        input_rx,
+        shutdown.clone(),
+        Arc::clone(&exit_code),
+    ));
+    tokio::spawn(run_persistent_console_output(
+        master,
+        output_tx.clone(),
+        shutdown.clone(),
+        Arc::clone(&exit_code),
+    ));
+    tokio::spawn(wait_for_persistent_console_exit(
+        child,
+        output_tx.clone(),
+        shutdown,
+        Arc::clone(&exit_code),
+        wait_label,
+        cleanup,
+    ));
+
+    Ok(PersistentConsoleRuntime {
+        input_tx,
+        output_tx,
+        exit_code,
+    })
+}
+
+async fn run_persistent_console_input(
+    master: Arc<AsyncFd<OwnedFd>>,
+    mut input_rx: mpsc::Receiver<ConsoleInput>,
+    shutdown: CancellationToken,
+    exit_code: Arc<StdMutex<Option<u32>>>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            maybe_input = input_rx.recv() => {
+                let Some(input) = maybe_input else {
+                    break;
+                };
+
+                let result = match input {
+                    ConsoleInput::Data(data) => pty_write_all(master.as_ref(), &data).await,
+                    ConsoleInput::Resize { rows, cols } => {
+                        set_pty_winsize(master.get_ref().as_raw_fd(), rows, cols);
+                        Ok(())
+                    }
+                };
+
+                if let Err(err) = result {
+                    if read_exit_code(exit_code.as_ref()).is_none() {
+                        warn!(error = ?err, "persistent console input failed");
+                    }
+                    shutdown.cancel();
                     break;
                 }
-                ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec())
-                    .write_to(&mut send)
-                    .await?;
             }
-            Ok::<(), anyhow::Error>(())
-        };
+        }
+    }
+}
 
-        let to_pty = async {
-            loop {
-                let frame = match ConsoleFrame::read_from(&mut recv).await {
-                    Ok(frame) => frame,
-                    Err(err) if is_unexpected_eof(&err) => break,
-                    Err(err) => return Err(err),
-                };
-                match frame.ty {
-                    CONSOLE_DATA => {
-                        pty_write_all(&master, &frame.payload).await?;
+async fn run_persistent_console_output(
+    master: Arc<AsyncFd<OwnedFd>>,
+    output_tx: broadcast::Sender<ConsoleFrame>,
+    shutdown: CancellationToken,
+    exit_code: Arc<StdMutex<Option<u32>>>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            result = pty_read(master.as_ref(), &mut buf) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = output_tx.send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()));
                     }
-                    CONSOLE_RESIZE => {
-                        let (rows, cols) = decode_resize(&frame.payload)?;
-                        set_pty_winsize(master.get_ref().as_raw_fd(), rows, cols);
+                    Err(err) => {
+                        if read_exit_code(exit_code.as_ref()).is_none() {
+                            warn!(error = ?err, "persistent console output failed");
+                        }
+                        break;
                     }
-                    _ => break,
                 }
             }
-            Ok::<(), anyhow::Error>(())
-        };
-
-        wait_for_child_or_console_io(&mut child, from_pty, to_pty).await?
-    };
-
-    let status = match termination {
-        ConsoleTermination::Shell(status) => status,
-        ConsoleTermination::Pty(result) => {
-            let status = child.wait().await.context("wait on shell after pty EOF")?;
-            result?;
-            status
         }
-        ConsoleTermination::Client(result) => {
-            let status = child
-                .wait()
-                .await
-                .context("wait on shell after client disconnect")?;
-            result?;
-            status
+    }
+}
+
+async fn wait_for_persistent_console_exit(
+    mut child: tokio::process::Child,
+    output_tx: broadcast::Sender<ConsoleFrame>,
+    shutdown: CancellationToken,
+    exit_code: Arc<StdMutex<Option<u32>>>,
+    wait_label: &'static str,
+    cleanup: Option<ExecSessionCleanup>,
+) {
+    let code = match child.wait().await {
+        Ok(status) => status.code().unwrap_or(255) as u32,
+        Err(err) => {
+            warn!(error = ?err, wait_label, "wait on persistent console failed");
+            255
         }
     };
-    let code = status.code().unwrap_or(255) as u32;
-    ConsoleFrame::new(CONSOLE_EXIT, code.to_be_bytes().to_vec())
-        .write_to(&mut send)
-        .await?;
-    send.finish().context("finish console stream")?;
+
+    {
+        let mut guard = exit_code.lock().unwrap();
+        *guard = Some(code);
+    }
+
+    let _ = output_tx.send(ConsoleFrame::new(CONSOLE_EXIT, code.to_be_bytes().to_vec()));
+    shutdown.cancel();
+
+    if let Some(cleanup) = cleanup {
+        if let Some(owner) = cleanup.owner.upgrade() {
+            let session = {
+                let guard = owner.sessions.lock().await;
+                guard.get(&cleanup.session_id).cloned()
+            };
+            if let Some(session) = session {
+                owner.remove_if_same(&cleanup.session_id, &session).await;
+            }
+        }
+    }
+}
+
+async fn relay_client_input(
+    recv: &mut quinn::RecvStream,
+    input_tx: &mpsc::Sender<ConsoleInput>,
+    takeover: Option<&CancellationToken>,
+) -> Result<()> {
+    loop {
+        if let Some(takeover) = takeover {
+            tokio::select! {
+                _ = takeover.cancelled() => break,
+                frame = ConsoleFrame::read_from(recv) => {
+                    match frame {
+                        Ok(frame) => forward_client_frame(frame, input_tx).await?,
+                        Err(err) if is_unexpected_eof(&err) => break,
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        } else {
+            let frame = match ConsoleFrame::read_from(recv).await {
+                Ok(frame) => frame,
+                Err(err) if is_unexpected_eof(&err) => break,
+                Err(err) => return Err(err),
+            };
+            forward_client_frame(frame, input_tx).await?;
+        }
+    }
 
     Ok(())
+}
+
+async fn forward_client_frame(
+    frame: ConsoleFrame,
+    input_tx: &mpsc::Sender<ConsoleInput>,
+) -> Result<()> {
+    let input = match frame.ty {
+        CONSOLE_DATA => ConsoleInput::Data(frame.payload),
+        CONSOLE_RESIZE => {
+            let (rows, cols) = decode_resize(&frame.payload)?;
+            ConsoleInput::Resize { rows, cols }
+        }
+        _ => return Ok(()),
+    };
+
+    let _ = input_tx.send(input).await;
+    Ok(())
+}
+
+async fn write_exit_frame(send: &mut quinn::SendStream, code: u32) -> Result<()> {
+    ConsoleFrame::new(CONSOLE_EXIT, code.to_be_bytes().to_vec())
+        .write_to(send)
+        .await
+}
+
+fn read_exit_code(exit_code: &StdMutex<Option<u32>>) -> Option<u32> {
+    *exit_code.lock().unwrap()
 }
 
 enum ConsoleLaunch {
@@ -352,31 +879,6 @@ async fn pty_write_all(master: &AsyncFd<OwnedFd>, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-enum ConsoleTermination {
-    Shell(std::process::ExitStatus),
-    Pty(Result<()>),
-    Client(Result<()>),
-}
-
-async fn wait_for_child_or_console_io<FPty, FClient>(
-    child: &mut tokio::process::Child,
-    from_pty: FPty,
-    to_pty: FClient,
-) -> Result<ConsoleTermination>
-where
-    FPty: Future<Output = Result<()>>,
-    FClient: Future<Output = Result<()>>,
-{
-    tokio::pin!(from_pty);
-    tokio::pin!(to_pty);
-
-    tokio::select! {
-        status = child.wait() => Ok(ConsoleTermination::Shell(status.context("wait on shell")?)),
-        result = &mut from_pty => Ok(ConsoleTermination::Pty(result)),
-        result = &mut to_pty => Ok(ConsoleTermination::Client(result)),
-    }
-}
-
 fn is_unexpected_eof(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -402,42 +904,12 @@ mod tests {
     use super::*;
     use nix::errno::Errno;
     use std::path::Path;
-    use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
 
     #[test]
     fn classify_pty_read_treats_eio_as_eof() {
         Errno::set(Errno::EIO);
         let result = classify_pty_read(-1).expect("eio should be mapped to eof");
         assert_eq!(result, Some(0));
-    }
-
-    #[tokio::test]
-    async fn child_exit_wins_even_if_console_io_never_completes() -> Result<()> {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "(sleep 5) & exit 7"])
-            .spawn()
-            .context("spawn shell")?;
-
-        let termination = timeout(
-            Duration::from_secs(1),
-            wait_for_child_or_console_io(
-                &mut child,
-                std::future::pending::<Result<()>>(),
-                std::future::pending::<Result<()>>(),
-            ),
-        )
-        .await
-        .context("timed out waiting for child exit")??;
-
-        match termination {
-            ConsoleTermination::Shell(status) => assert_eq!(status.code(), Some(7)),
-            ConsoleTermination::Pty(_) | ConsoleTermination::Client(_) => {
-                panic!("expected shell exit to win")
-            }
-        }
-
-        Ok(())
     }
 
     #[test]
@@ -468,6 +940,35 @@ mod tests {
                 "/",
             ]
         );
+    }
+
+    #[test]
+    fn shared_console_manager_starts_without_session() {
+        let manager = SharedConsoleManager::new();
+        let guard = manager.session.try_lock().expect("lock manager");
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_session_attach_replaces_previous_attachment() -> Result<()> {
+        let session = Arc::new(ExecSession {
+            session_id: "sess".to_string(),
+            argv: vec!["sh".to_string()],
+            context: Some("test context".to_string()),
+            runtime: PersistentConsoleRuntime {
+                input_tx: mpsc::channel(1).0,
+                output_tx: broadcast::channel(1).0,
+                exit_code: Arc::new(StdMutex::new(None)),
+            },
+            attachment: Mutex::new(ExecAttachmentState::default()),
+        });
+
+        let first = session.attach().await?;
+        let second = session.attach().await?;
+
+        assert!(first.takeover.is_cancelled());
+        assert!(!second.takeover.is_cancelled());
+        Ok(())
     }
 }
 

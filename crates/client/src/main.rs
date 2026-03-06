@@ -32,8 +32,15 @@ enum Command {
     },
     Exec {
         vault: String,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
+    },
+    ListExec {
+        vault: String,
     },
     Build,
 }
@@ -104,7 +111,12 @@ async fn main() -> Result<()> {
 
             quic::connect_and_run(vault_cfg, forwards, reprovision).await?;
         }
-        Command::Exec { vault, command } => {
+        Command::Exec {
+            vault,
+            session,
+            context,
+            command,
+        } => {
             let (_, mut cfg_file) = load_config_file()?;
             let vault_cfg = resolve_vault_config(&mut cfg_file, &vault)?;
             let command = command
@@ -114,10 +126,24 @@ async fn main() -> Result<()> {
                         .map_err(|arg| anyhow!("exec arguments must be valid UTF-8: {:?}", arg))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let exit_code = quic::connect_and_exec(vault_cfg, command).await?;
+            if session.is_none() && command.is_empty() {
+                return Err(anyhow!(
+                    "exec requires a command unless --session is provided"
+                ));
+            }
+            let exit_code = quic::connect_and_exec(vault_cfg, session, context, command).await?;
             if exit_code != 0 {
                 std::process::exit((exit_code & 0xff) as i32);
             }
+        }
+        Command::ListExec { vault } => {
+            let (_, mut cfg_file) = load_config_file()?;
+            let vault_cfg = resolve_vault_config(&mut cfg_file, &vault)?;
+            let sessions = quic::list_exec_sessions(vault_cfg).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sessions).context("serialize exec sessions")?
+            );
         }
         Command::Build => {
             run_build_commands()?;
@@ -257,13 +283,74 @@ app = "my-app"
             .expect("parse exec command");
 
         match cli.command {
-            Command::Exec { vault, command } => {
+            Command::Exec {
+                vault,
+                session,
+                context,
+                command,
+            } => {
                 assert_eq!(vault, "my-dev");
+                assert_eq!(session, None);
+                assert_eq!(context, None);
                 let command = command
                     .into_iter()
                     .map(|arg| arg.into_string().unwrap())
                     .collect::<Vec<_>>();
                 assert_eq!(command, vec!["ls", "-lash", "/"]);
+            }
+            other => panic!("expected exec command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_command_parses_optional_session() {
+        let cli = Cli::try_parse_from(["fly-vault", "exec", "my-dev", "--session", "sess-1"])
+            .expect("parse exec command with session");
+
+        match cli.command {
+            Command::Exec {
+                vault,
+                session,
+                context,
+                command,
+            } => {
+                assert_eq!(vault, "my-dev");
+                assert_eq!(session.as_deref(), Some("sess-1"));
+                assert_eq!(context, None);
+                assert!(command.is_empty());
+            }
+            other => panic!("expected exec command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_command_parses_optional_context() {
+        let cli = Cli::try_parse_from([
+            "fly-vault",
+            "exec",
+            "my-dev",
+            "--context",
+            "investigate deploy failure",
+            "--",
+            "sh",
+        ])
+        .expect("parse exec command with context");
+
+        match cli.command {
+            Command::Exec {
+                vault,
+                session,
+                context,
+                command,
+            } => {
+                assert_eq!(vault, "my-dev");
+                assert_eq!(session, None);
+                assert_eq!(context.as_deref(), Some("investigate deploy failure"));
+                let command = command
+                    .into_iter()
+                    .map(|arg| arg.into_string().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(command, vec!["sh"]);
             }
             other => panic!("expected exec command, got {other:?}"),
         }

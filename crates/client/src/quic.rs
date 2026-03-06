@@ -5,8 +5,8 @@ use crate::proxy_udp::ProxyUdpSocket;
 use crate::{TransportConfig, VaultConfig};
 use anyhow::{anyhow, Context, Result};
 use protocol::{
-    AttestationPayload, ControlMessage, RootfsSource, RuntimeStatus, SetupRequest, VmState,
-    CHANNEL_BINDING_LABEL, PROTOCOL_VERSION, STREAM_CONTROL,
+    AttestationPayload, ControlMessage, RootfsSource, SetupRequest, VmState, CHANNEL_BINDING_LABEL,
+    PROTOCOL_VERSION, STREAM_CONTROL,
 };
 use quinn::{default_runtime, ClientConfig, Endpoint, EndpointConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -123,7 +123,6 @@ async fn validate_attestation(
         attest::verify_attestation_jwt(&http_client, &attestation.jwt, &cfg.org, aud).await?;
     assert_org_and_app(&claims.iss, &claims.app_name, cfg)?;
     assert_machine_id(&claims.machine_id, transport)?;
-    assert_runtime_status(attestation)?;
     info!(
         issuer = %claims.iss,
         app = %claims.app_name,
@@ -133,22 +132,6 @@ async fn validate_attestation(
         "attestation verified"
     );
     Ok(())
-}
-
-fn assert_runtime_status(attestation: &AttestationPayload) -> Result<()> {
-    match (attestation.state, attestation.runtime_status) {
-        (VmState::Cold, RuntimeStatus::NotStarted) => Ok(()),
-        (VmState::Ready, RuntimeStatus::SystemInit) => Ok(()),
-        (VmState::Ready, RuntimeStatus::FallbackInit) => {
-            Err(anyhow!("server runtime degraded: fallback init is active"))
-        }
-        (VmState::Cold, status) => Err(anyhow!(
-            "invalid cold-state runtime status reported by server: {status:?}"
-        )),
-        (VmState::Ready, status) => Err(anyhow!(
-            "invalid ready-state runtime status reported by server: {status:?}"
-        )),
-    }
 }
 
 async fn provisioning_source(
@@ -241,6 +224,7 @@ fn insecure_client_config() -> Result<ClientConfig> {
             .try_into()
             .context("idle timeout")?,
     ));
+    transport.mtu_discovery_config(None);
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
 
     let mut client_config = ClientConfig::new(Arc::new(

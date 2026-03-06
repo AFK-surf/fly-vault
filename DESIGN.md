@@ -58,9 +58,6 @@ Attestation also reports runtime health separately from `VmState`:
 - `FallbackInit`: `/sbin/init` failed and the namespace is being held by a
   minimal fallback reaper.
 
-Clients reject `FallbackInit` for normal reconnects. It is only tolerated as a
-degraded runtime immediately before reprovision.
-
 ## 4. Control Protocol
 
 The protocol is versioned. Current version: `1`.

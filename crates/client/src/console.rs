@@ -3,7 +3,7 @@ use protocol::{
     decode_exit, encode_exec_argv, encode_resize, ConsoleFrame, CONSOLE_DATA, CONSOLE_EXEC,
     CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL, STREAM_CONSOLE,
 };
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncWriteExt;
@@ -17,7 +17,10 @@ pub async fn run_console(conn: quinn::Connection) -> Result<()> {
 pub async fn run_exec(conn: quinn::Connection, argv: Vec<String>) -> Result<u32> {
     run_session(
         conn,
-        ConsoleFrame::new(CONSOLE_EXEC, encode_exec_argv(&argv)),
+        ConsoleFrame::new(
+            CONSOLE_EXEC,
+            encode_exec_argv(&wrap_exec_with_term(argv, current_term_for_exec())),
+        ),
     )
     .await
 }
@@ -44,23 +47,7 @@ async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<ConsoleFrame>(64);
 
-    let stdin_task = tokio::spawn({
-        let tx = frame_tx.clone();
-        async move {
-            let stdin = open_nonblocking_stdin().context("open nonblocking stdin")?;
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = read_stdin(&stdin, &mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                let _ = tx
-                    .send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()))
-                    .await;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    });
+    let stdin_task = spawn_stdin_task(is_tty, frame_tx.clone());
 
     let resize_task = tokio::spawn({
         let tx = frame_tx;
@@ -133,6 +120,70 @@ async fn run_session(conn: quinn::Connection, startup: ConsoleFrame) -> Result<u
 
     let exit_code = exit_result?;
     Ok(exit_code)
+}
+
+fn current_term_for_exec() -> Option<String> {
+    if !(std::io::stdin().is_terminal() || std::io::stdout().is_terminal()) {
+        return None;
+    }
+
+    Some("xterm".to_string())
+}
+
+fn wrap_exec_with_term(argv: Vec<String>, term: Option<String>) -> Vec<String> {
+    let Some(term) = term else {
+        return argv;
+    };
+
+    let mut wrapped = Vec::with_capacity(argv.len() + 5);
+    wrapped.push("/bin/sh".to_string());
+    wrapped.push("-lc".to_string());
+    wrapped.push("export TERM=\"$1\"; shift; exec \"$@\"".to_string());
+    wrapped.push("sh".to_string());
+    wrapped.push(term);
+    wrapped.extend(argv);
+    wrapped
+}
+
+fn spawn_stdin_task(
+    is_tty: bool,
+    tx: tokio::sync::mpsc::Sender<ConsoleFrame>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    if is_tty {
+        tokio::spawn(async move {
+            let stdin = open_nonblocking_stdin().context("open nonblocking stdin")?;
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = read_stdin(&stdin, &mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                let _ = tx
+                    .send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()))
+                    .await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stdin.read(&mut buf).context("read local stdin")?;
+                if n == 0 {
+                    break;
+                }
+                if tx
+                    .blocking_send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    }
 }
 
 /// RAII guard that restores the original terminal settings on drop.
@@ -242,5 +293,49 @@ fn try_read_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
     match err.raw_os_error() {
         Some(libc::EAGAIN) => Ok(None),
         _ => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_exec_with_term;
+
+    #[test]
+    fn wrap_exec_with_term_preserves_plain_exec_without_term() {
+        let argv = vec![
+            "tmux".to_string(),
+            "attach".to_string(),
+            "-t".to_string(),
+            "svc".to_string(),
+        ];
+        assert_eq!(wrap_exec_with_term(argv.clone(), None), argv);
+    }
+
+    #[test]
+    fn wrap_exec_with_term_injects_shell_wrapper() {
+        let wrapped = wrap_exec_with_term(
+            vec![
+                "tmux".to_string(),
+                "attach".to_string(),
+                "-t".to_string(),
+                "svc".to_string(),
+            ],
+            Some("tmux-256color".to_string()),
+        );
+
+        assert_eq!(
+            wrapped,
+            vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "export TERM=\"$1\"; shift; exec \"$@\"".to_string(),
+                "sh".to_string(),
+                "tmux-256color".to_string(),
+                "tmux".to_string(),
+                "attach".to_string(),
+                "-t".to_string(),
+                "svc".to_string(),
+            ]
+        );
     }
 }

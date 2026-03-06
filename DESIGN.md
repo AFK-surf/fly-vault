@@ -9,6 +9,10 @@ Current model:
 
 - Attestation: the client verifies a Fly OIDC JWT (`iss`, `aud`, `app_name`)
   bound to TLS exporter material.
+- Trust reuse: once a specific `init` TLS leaf certificate fingerprint has
+  passed attestation for an `(org, app, machine_id)` tuple, the client may
+  reuse that result from an on-disk cache until `init` restarts and rotates
+  its in-memory keypair.
 - Authentication: one shared `ACCESS_TOKEN` authorizes both first-time
   provisioning and reconnects.
 - Storage: the active rootfs lives at `/data/rootfs`, while persistent `/root`
@@ -81,40 +85,120 @@ Control messages:
 This replaced the older multi-frame control flow. There is no backward
 compatibility path for the previous frame layout or previous `VmState` values.
 
+No wire-format change is required for attestation caching. The client can keep
+requesting `CONTROL_ATTESTATION` on every connection and decide locally whether
+the JWT needs full verification.
+
 ## 5. Authentication And Provisioning Flow
 
 ### 5.1 Cold boot
 
-1. Client opens the control stream and requests attestation.
-2. `init` returns an attestation payload containing:
+1. Client completes the QUIC handshake, extracts the server TLS leaf
+   certificate fingerprint, and checks the local attestation cache.
+2. Client opens the control stream and requests attestation.
+3. `init` returns an attestation payload containing:
    - protocol version
    - `VmState`
    - `RuntimeStatus`
    - attestation JWT
-3. Client verifies protocol version, runtime status, and attestation claims.
-4. Client sends one `CONTROL_SETUP_REQUEST` containing the access token and a
+4. On a cache miss, the client performs full JWT verification against the
+   exporter-derived audience and stores the verified fingerprint on disk.
+5. On a cache hit, the client skips JWT verification and trusts the connection
+   based on the cached fingerprint.
+6. Client still checks protocol version and consumes `VmState` and
+   `RuntimeStatus` from the attestation payload.
+7. Client sends one `CONTROL_SETUP_REQUEST` containing the access token and a
    rootfs source.
-5. `init` verifies the token, resolves the rootfs source, stages the rootfs,
+8. `init` verifies the token, resolves the rootfs source, stages the rootfs,
    promotes it atomically, starts the namespaced runtime, and returns
    `CONTROL_SETUP_COMPLETE`.
 
 ### 5.2 Reconnect (`Ready`)
 
-1. Client requests and verifies attestation.
-2. Client sends `CONTROL_SETUP_REQUEST` with the access token and `rootfs=None`.
-3. `init` verifies the token, ensures the runtime is live, and returns
+1. Client completes the QUIC handshake, extracts the server TLS fingerprint,
+   and checks the local attestation cache.
+2. Client requests `CONTROL_ATTESTATION`.
+3. On a cache miss, the client performs the current full attestation flow and
+   stores the verified fingerprint.
+4. On a cache hit, the client skips JWT verification but still checks protocol
+   version and reads `VmState` and `RuntimeStatus`.
+5. Client sends `CONTROL_SETUP_REQUEST` with the access token and `rootfs=None`.
+6. `init` verifies the token, ensures the runtime is live, and returns
    `CONTROL_SETUP_COMPLETE`.
 
 ### 5.3 Reprovision (`Ready`)
 
-1. Client requests and verifies attestation.
-2. Client sends `CONTROL_SETUP_REQUEST` with the access token and a new rootfs
+1. Client completes the QUIC handshake, extracts the server TLS fingerprint,
+   and checks the local attestation cache.
+2. Client requests `CONTROL_ATTESTATION`.
+3. On a cache miss, the client performs the current full attestation flow and
+   stores the verified fingerprint.
+4. On a cache hit, the client skips JWT verification but still checks protocol
+   version and reads `VmState` and `RuntimeStatus`.
+5. Client sends `CONTROL_SETUP_REQUEST` with the access token and a new rootfs
    source.
-3. `init` stages the new rootfs under `/data/rootfs.staging`.
-4. `init` stops the old runtime, moves the existing rootfs aside, promotes the
+6. `init` stages the new rootfs under `/data/rootfs.staging`.
+7. `init` stops the old runtime, moves the existing rootfs aside, promotes the
    staged rootfs, and starts a new runtime.
-5. If runtime start fails, `init` restores the previous rootfs and attempts to
+8. If runtime start fails, `init` restores the previous rootfs and attempts to
    restart the previous runtime.
+
+### 5.4 Attestation cache
+
+The attestation cache lives entirely on the client. `init` remains stateless
+with respect to attestation reuse.
+
+Cache key:
+
+- `org`
+- `app`
+- `machine_id`
+- TLS leaf certificate fingerprint: `sha256(peer_cert_der)`, derived from the
+  leaf certificate returned by `quinn::Connection::peer_identity()`
+
+Cache entry fields:
+
+- `org`
+- `app`
+- `machine_id`
+- `fingerprint`
+- `verified_at`
+- `last_seen_at`
+
+Recommended path:
+
+- `${XDG_CACHE_HOME}/fly-vault/attestation-cache-v1.json`
+- fallback: `~/.cache/fly-vault/attestation-cache-v1.json`
+
+Lookup rules:
+
+- Proxy transport: require an exact match on configured `machine_id`,
+  `org`, `app`, and fingerprint.
+- Direct transport: allow lookup by `org`, `app`, and fingerprint, then reuse
+  the cached `machine_id` learned from the last successful attestation for that
+  fingerprint.
+- A cache hit is only a trust shortcut. The client still requests
+  `CONTROL_ATTESTATION` to learn `VmState`, `RuntimeStatus`, and protocol
+  version for the current connection.
+
+Population rules:
+
+- Only write an entry after a full attestation succeeds.
+- The `machine_id` written to the cache comes from verified attestation claims,
+  never from configuration alone.
+- Update `last_seen_at` on successful cache-hit connections.
+- Use read-modify-write with a temp file plus atomic rename so concurrent
+  client processes do not leave a truncated cache file behind.
+
+Invalidation rules:
+
+- If `init` restarts and generates a new ephemeral certificate, the fingerprint
+  changes and the client falls back to full attestation automatically.
+- If a cached entry does not match the configured proxy `machine_id`, ignore it
+  and require full attestation.
+- Negative results are not cached.
+- Stale entries may be garbage-collected opportunistically; they are harmless
+  because a mismatched fingerprint already forces re-attestation.
 
 ## 6. Setup Manager Behavior
 
@@ -151,7 +235,12 @@ rootfs = "~/rootfs.tar.gz"
 # or rootfs_url = "https://.../rootfs.tar.gz"
 ```
 
-### 7.2 Machine env
+### 7.2 Client cache
+
+No new user-managed config is required. The client maintains the attestation
+cache under the OS cache directory and treats it as disposable local state.
+
+### 7.3 Machine env
 
 `init` expects:
 
@@ -185,8 +274,12 @@ After startup, the process removes `ACCESS_TOKEN` from the environment with
 
 - No client-held disk encryption.
 - No strict digest allowlist or machine-config verification yet.
-- Security still depends on attestation validation, transport security, and
-  token secrecy.
+- Security still depends on initial attestation validation, transport security,
+  and token secrecy.
+- Cache hits no longer prove fresh per-connection exporter binding through the
+  JWT. Instead they rely on continuity of the same ephemeral TLS private key,
+  which is acceptable because that key is generated in-memory by `init`, is not
+  persisted, and rotates on process restart.
 - Fallback init is a degraded recovery path, not a full substitute for a
   healthy `/sbin/init`.
 
@@ -198,3 +291,13 @@ Recommended checks after changes:
 - `cargo check`
 - `cargo test`
 - `cargo test -p init --bin init`
+
+Implementation tests to add for this change:
+
+- cache miss performs full attestation and persists a fingerprint entry
+- cache hit skips JWT verification but still reads `CONTROL_ATTESTATION`
+- proxy mode rejects cache entries whose `machine_id` differs from config
+- direct mode can reuse a cached fingerprint and remembered attested
+  `machine_id`
+- rotated server certificate causes a cache miss and re-attestation
+- cache file writes are atomic and tolerate concurrent client processes

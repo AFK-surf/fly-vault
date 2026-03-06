@@ -531,7 +531,7 @@ fn insecure_client_config() -> Result<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
-    tls.alpn_protocols = vec![b"fly-vault".to_vec()];
+    tls.alpn_protocols = vec![b"h3".to_vec()];
 
     let cfg = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|e| anyhow!("build quinn rustls client config: {e}"))?;

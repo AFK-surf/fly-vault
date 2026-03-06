@@ -1,4 +1,5 @@
 mod attest;
+mod cache;
 mod console;
 mod forward;
 mod proxy_udp;

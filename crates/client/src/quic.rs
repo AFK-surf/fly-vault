@@ -1,4 +1,5 @@
 use crate::attest;
+use crate::cache::{AttestationCache, CacheEntry};
 use crate::console;
 use crate::forward;
 use crate::proxy_udp::ProxyUdpSocket;
@@ -12,11 +13,13 @@ use quinn::{default_runtime, ClientConfig, Endpoint, EndpointConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256};
+use std::any::Any;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn connect_and_run(
     cfg: VaultConfig,
@@ -54,6 +57,8 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
         .connect(remote, "fly-vault")
         .context("connect quic")?;
     let conn = connect.await.context("await quic connect")?;
+    let tls_fingerprint = server_cert_fingerprint(&conn)?;
+    let mut attestation_cache = load_attestation_cache();
 
     let aud = export_attestation_audience(&conn)?;
     let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
@@ -70,7 +75,15 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
         ControlMessage::Attestation(payload) => payload,
         other => return Err(anyhow!("expected attestation frame, got {other:?}")),
     };
-    validate_attestation(cfg, &transport, &attestation, &aud).await?;
+    validate_attestation(
+        cfg,
+        &transport,
+        &attestation,
+        &aud,
+        &tls_fingerprint,
+        &mut attestation_cache,
+    )
+    .await?;
 
     let access_token = cfg
         .access_token
@@ -105,13 +118,20 @@ async fn validate_attestation(
     transport: &TransportConfig,
     attestation: &AttestationPayload,
     aud: &str,
+    tls_fingerprint: &str,
+    attestation_cache: &mut AttestationCache,
 ) -> Result<()> {
-    if attestation.protocol_version != PROTOCOL_VERSION {
-        return Err(anyhow!(
-            "protocol version mismatch: server={} client={}",
-            attestation.protocol_version,
-            PROTOCOL_VERSION
-        ));
+    assert_protocol_version(attestation)?;
+
+    if let Some(entry) = attestation_cache
+        .lookup(cfg, transport, tls_fingerprint)
+        .cloned()
+    {
+        if let Err(err) = attestation_cache.record_cache_hit(cfg, transport, tls_fingerprint) {
+            warn!(error = ?err, "failed to update attestation cache hit timestamp");
+        }
+        log_cached_attestation_hit(attestation, tls_fingerprint, &entry);
+        return Ok(());
     }
 
     let http_client = reqwest::Client::builder()
@@ -123,15 +143,73 @@ async fn validate_attestation(
         attest::verify_attestation_jwt(&http_client, &attestation.jwt, &cfg.org, aud).await?;
     assert_org_and_app(&claims.iss, &claims.app_name, cfg)?;
     assert_machine_id(&claims.machine_id, transport)?;
+    if let Err(err) = attestation_cache.record_verified(cfg, &claims.machine_id, tls_fingerprint) {
+        warn!(error = ?err, "failed to persist attestation cache entry");
+    }
     info!(
         issuer = %claims.iss,
         app = %claims.app_name,
         machine = %claims.machine_id,
+        tls_fingerprint,
         state = ?attestation.state,
         runtime_status = ?attestation.runtime_status,
         "attestation verified"
     );
     Ok(())
+}
+
+fn load_attestation_cache() -> AttestationCache {
+    match AttestationCache::load_default() {
+        Ok(cache) => cache,
+        Err(err) => {
+            warn!(error = ?err, "failed to load attestation cache; continuing without cache");
+            AttestationCache::default()
+        }
+    }
+}
+
+fn assert_protocol_version(attestation: &AttestationPayload) -> Result<()> {
+    if attestation.protocol_version != PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "protocol version mismatch: server={} client={}",
+            attestation.protocol_version,
+            PROTOCOL_VERSION
+        ));
+    }
+
+    Ok(())
+}
+
+fn server_cert_fingerprint(conn: &quinn::Connection) -> Result<String> {
+    let identity = conn
+        .peer_identity()
+        .ok_or_else(|| anyhow!("missing peer identity"))?;
+    server_cert_fingerprint_from_identity(identity)
+}
+
+fn server_cert_fingerprint_from_identity(identity: Box<dyn Any>) -> Result<String> {
+    let certs = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| anyhow!("unexpected peer identity type"))?;
+    let cert = certs
+        .first()
+        .ok_or_else(|| anyhow!("peer identity did not include a certificate"))?;
+    Ok(hex::encode(Sha256::digest(cert.as_ref())))
+}
+
+fn log_cached_attestation_hit(
+    attestation: &AttestationPayload,
+    tls_fingerprint: &str,
+    entry: &CacheEntry,
+) {
+    info!(
+        app = %entry.app,
+        machine = %entry.machine_id,
+        tls_fingerprint,
+        state = ?attestation.state,
+        runtime_status = ?attestation.runtime_status,
+        "reused cached attestation"
+    );
 }
 
 async fn provisioning_source(
@@ -214,7 +292,7 @@ fn insecure_client_config() -> Result<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
-    tls.alpn_protocols = vec![b"fly-vault".to_vec()];
+    tls.alpn_protocols = vec![b"h3".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(1200);
@@ -322,8 +400,12 @@ impl ServerCertVerifier for NoVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::assert_machine_id;
+    use super::{
+        assert_machine_id, assert_protocol_version, server_cert_fingerprint_from_identity,
+    };
     use crate::{TransportConfig, VaultConfig};
+    use protocol::{AttestationPayload, RuntimeStatus, VmState, PROTOCOL_VERSION};
+    use rustls_pki_types::CertificateDer;
 
     fn make_cfg(transport: TransportConfig) -> VaultConfig {
         VaultConfig {
@@ -367,5 +449,51 @@ mod tests {
         assert!(err
             .to_string()
             .contains("attestation machine mismatch: machine_id=machine-999 expected=machine-123"));
+    }
+
+    #[test]
+    fn protocol_version_check_accepts_current_version() {
+        let attestation = AttestationPayload {
+            protocol_version: PROTOCOL_VERSION,
+            state: VmState::Ready,
+            runtime_status: RuntimeStatus::SystemInit,
+            jwt: "jwt".to_string(),
+        };
+        assert_protocol_version(&attestation).expect("matching protocol version should pass");
+    }
+
+    #[test]
+    fn protocol_version_check_rejects_mismatch() {
+        let attestation = AttestationPayload {
+            protocol_version: PROTOCOL_VERSION + 1,
+            state: VmState::Ready,
+            runtime_status: RuntimeStatus::SystemInit,
+            jwt: "jwt".to_string(),
+        };
+        let err =
+            assert_protocol_version(&attestation).expect_err("mismatched protocol should fail");
+        assert!(err.to_string().contains("protocol version mismatch"));
+    }
+
+    #[test]
+    fn server_cert_fingerprint_uses_leaf_certificate() {
+        let identity: Box<dyn std::any::Any> = Box::new(vec![
+            CertificateDer::from(vec![1u8, 2, 3, 4]),
+            CertificateDer::from(vec![9u8, 9, 9, 9]),
+        ]);
+        let fingerprint = server_cert_fingerprint_from_identity(identity)
+            .expect("fingerprint should be derived from peer identity");
+        assert_eq!(
+            fingerprint,
+            "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
+        );
+    }
+
+    #[test]
+    fn server_cert_fingerprint_rejects_empty_chain() {
+        let identity: Box<dyn std::any::Any> = Box::new(Vec::<CertificateDer<'static>>::new());
+        let err = server_cert_fingerprint_from_identity(identity)
+            .expect_err("empty certificate chain should fail");
+        assert!(err.to_string().contains("did not include a certificate"));
     }
 }

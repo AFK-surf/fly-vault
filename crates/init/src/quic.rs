@@ -55,7 +55,7 @@ fn build_server_config() -> Result<ServerConfig> {
         .with_no_client_auth()
         .with_single_cert(cert_chain, key.into())
         .context("build rustls server config")?;
-    tls.alpn_protocols = vec![b"fly-vault".to_vec()];
+    tls.alpn_protocols = vec![b"h3".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(1200);

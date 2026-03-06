@@ -8,7 +8,7 @@ Remote development VM tooling for Fly.io with attestation-gated access and token
 
 - `fly-vault` (client): runs on your laptop, verifies attestation, authenticates with `access_token`, opens console/port forwards.
 - `fly-vault-admin` (deployment admin): runs on your laptop or CI, manages tenant machines in `vault-tenants` via the Fly Machines API.
-- `init` (server): runs as the Fly Machine entrypoint, serves QUIC, provisions rootfs to `/data/rootfs`, and boots the workload.
+- `init` (server): runs as the Fly Machine entrypoint, serves QUIC, provisions rootfs to `/data/rootfs`, preserves `/root` and `/home` under `/data/persist`, and boots the workload.
 - `vault-proxy` (UDP multiplexer): routes client UDP packets to tenant machines by machine id.
 - shared `protocol` crate: stream tags, control/console framing, shared wire types.
 
@@ -19,7 +19,7 @@ The design is documented in [DESIGN.md](DESIGN.md).
 - Attestation authenticity: client verifies Fly OIDC JWT signature and checks `iss` + `aud` channel binding + `app_name`.
 - Transport security: QUIC (TLS 1.3).
 - Authentication: single `ACCESS_TOKEN` used for initial provisioning and reconnects.
-- Data at rest: filesystem is stored directly on the Fly volume (`/data/rootfs`) without client-side disk encryption.
+- Data at rest: the VM rootfs plus persistent `/root` and `/home` state are stored on the Fly volume (`/data/rootfs` and `/data/persist`) without client-side disk encryption.
 
 Important: because data is not encrypted client-side, Fly platform operators with host/platform access can read persisted VM data.
 
@@ -80,7 +80,7 @@ fly-vault connect <vault-name> --reprovision
 fly-vault build
 ```
 
-`--reprovision` sends a new rootfs tarball to a ready VM after successful token authentication.
+`--reprovision` sends a new rootfs tarball to a ready VM after successful token authentication. The reprovision replaces the extracted rootfs in place but preserves `/root` and `/home`.
 
 For local development via Cargo:
 

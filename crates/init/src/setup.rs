@@ -7,6 +7,7 @@ use nix::unistd::{chdir, execv, pivot_root, Pid};
 use protocol::VmState;
 use std::ffi::CString;
 use std::fs;
+use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use tokio::task;
 use tracing::{info, warn};
@@ -16,6 +17,7 @@ pub struct SetupManager {
     root_mount_dir: PathBuf,
     init_binary: PathBuf,
     provisioned_marker_file: PathBuf,
+    persistent_mounts: Vec<PersistentMount>,
     test_mode: bool,
     runtime: Option<RuntimeState>,
 }
@@ -23,6 +25,12 @@ pub struct SetupManager {
 #[derive(Debug)]
 struct RuntimeState {
     _inner_init_pid: Option<Pid>,
+}
+
+#[derive(Debug, Clone)]
+struct PersistentMount {
+    source: PathBuf,
+    target_relative: PathBuf,
 }
 
 impl SetupManager {
@@ -33,10 +41,21 @@ impl SetupManager {
         test_mode: bool,
     ) -> Result<Self> {
         let provisioned_marker_file = data_dir.join(".provisioned");
+        let persistent_state_dir = data_dir.join("persist");
         Ok(Self {
             root_mount_dir,
             init_binary,
             provisioned_marker_file,
+            persistent_mounts: vec![
+                PersistentMount {
+                    source: persistent_state_dir.join("root"),
+                    target_relative: PathBuf::from("root"),
+                },
+                PersistentMount {
+                    source: persistent_state_dir.join("home"),
+                    target_relative: PathBuf::from("home"),
+                },
+            ],
             test_mode,
             runtime: None,
         })
@@ -86,6 +105,8 @@ impl SetupManager {
         if self.test_mode {
             if is_provisioning {
                 self.reset_root_mount_dir()?;
+                extract_rootfs_if_present(&self.root_mount_dir, rootfs_tarball.as_deref())?;
+                self.prepare_persistent_layout()?;
                 self.store_provision_marker()?;
             }
             self.ensure_runtime_started()?;
@@ -95,6 +116,7 @@ impl SetupManager {
         if let Some(data) = rootfs_tarball {
             self.reset_root_mount_dir()?;
             extract_rootfs(&self.root_mount_dir, &data)?;
+            self.prepare_persistent_layout()?;
             self.store_provision_marker()?;
         }
 
@@ -122,6 +144,7 @@ impl SetupManager {
         }
 
         if self.test_mode {
+            self.materialize_test_mode_persistent_links()?;
             self.runtime = Some(RuntimeState {
                 _inner_init_pid: None,
             });
@@ -141,7 +164,11 @@ impl SetupManager {
                 );
                 None
             } else {
-                match launch_namespaced_init(&self.root_mount_dir, &self.init_binary) {
+                match launch_namespaced_init(
+                    &self.root_mount_dir,
+                    &self.init_binary,
+                    self.persistent_mounts.clone(),
+                ) {
                     Ok(pid) => Some(pid),
                     Err(err) => {
                         warn!(error = ?err, "inner init launch failed, continuing without it");
@@ -199,6 +226,60 @@ impl SetupManager {
         fs::create_dir_all(&self.root_mount_dir)
             .with_context(|| format!("create {}", self.root_mount_dir.display()))
     }
+
+    fn prepare_persistent_layout(&self) -> Result<()> {
+        for persistent_mount in &self.persistent_mounts {
+            let target = self.root_mount_dir.join(&persistent_mount.target_relative);
+            self.ensure_persistent_source_dir(persistent_mount, &target)?;
+
+            if self.test_mode {
+                replace_with_symlink(&persistent_mount.source, &target)?;
+            } else {
+                ensure_directory(&target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_persistent_source_dir(
+        &self,
+        persistent_mount: &PersistentMount,
+        target: &Path,
+    ) -> Result<()> {
+        if !persistent_mount.source.exists() {
+            if let Ok(metadata) = fs::symlink_metadata(target) {
+                if metadata.is_dir() {
+                    if let Some(parent) = persistent_mount.source.parent() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("create {}", parent.display()))?;
+                    }
+                    fs::rename(target, &persistent_mount.source).with_context(|| {
+                        format!(
+                            "move {} to {}",
+                            target.display(),
+                            persistent_mount.source.display()
+                        )
+                    })?;
+                } else {
+                    return Err(anyhow!(
+                        "persistent target {} must be a directory",
+                        target.display()
+                    ));
+                }
+            }
+        }
+
+        ensure_directory(&persistent_mount.source)
+    }
+
+    fn materialize_test_mode_persistent_links(&self) -> Result<()> {
+        for persistent_mount in &self.persistent_mounts {
+            let target = self.root_mount_dir.join(&persistent_mount.target_relative);
+            self.ensure_persistent_source_dir(persistent_mount, &target)?;
+            replace_with_symlink(&persistent_mount.source, &target)?;
+        }
+        Ok(())
+    }
 }
 
 fn extract_rootfs(target_root: &Path, data: &[u8]) -> Result<()> {
@@ -210,13 +291,24 @@ fn extract_rootfs(target_root: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn launch_namespaced_init(root: &Path, init_binary: &Path) -> Result<Pid> {
+fn extract_rootfs_if_present(target_root: &Path, data: Option<&[u8]>) -> Result<()> {
+    if let Some(data) = data {
+        extract_rootfs(target_root, data)?;
+    }
+    Ok(())
+}
+
+fn launch_namespaced_init(
+    root: &Path,
+    init_binary: &Path,
+    persistent_mounts: Vec<PersistentMount>,
+) -> Result<Pid> {
     let mut stack = vec![0u8; 1024 * 1024];
     let root = root.to_path_buf();
     let init_binary = init_binary.to_path_buf();
 
     let cb = Box::new(move || -> isize {
-        if let Err(err) = child_bootstrap(&root, &init_binary) {
+        if let Err(err) = child_bootstrap(&root, &init_binary, &persistent_mounts) {
             eprintln!("child bootstrap failed: {err:#}");
             return 1;
         }
@@ -230,7 +322,11 @@ fn launch_namespaced_init(root: &Path, init_binary: &Path) -> Result<Pid> {
     Ok(pid)
 }
 
-fn child_bootstrap(root: &Path, init_binary: &Path) -> Result<()> {
+fn child_bootstrap(
+    root: &Path,
+    init_binary: &Path,
+    persistent_mounts: &[PersistentMount],
+) -> Result<()> {
     mount(
         None::<&str>,
         "/",
@@ -250,6 +346,8 @@ fn child_bootstrap(root: &Path, init_binary: &Path) -> Result<()> {
         None::<&str>,
     )
     .with_context(|| format!("bind-mount new root {}", root.display()))?;
+
+    bind_persistent_mounts(root, persistent_mounts)?;
 
     let old_root = root.join(".old_root");
     if !old_root.exists() {
@@ -274,4 +372,62 @@ fn child_bootstrap(root: &Path, init_binary: &Path) -> Result<()> {
 
     execv(&init_c, &args).with_context(|| format!("exec {}", init_binary.display()))?;
     Ok(())
+}
+
+fn bind_persistent_mounts(root: &Path, persistent_mounts: &[PersistentMount]) -> Result<()> {
+    for persistent_mount in persistent_mounts {
+        ensure_directory(&persistent_mount.source)?;
+
+        let target = root.join(&persistent_mount.target_relative);
+        ensure_directory(&target)?;
+
+        mount(
+            Some(persistent_mount.source.as_path()),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .with_context(|| {
+            format!(
+                "bind-mount persistent {} onto {}",
+                persistent_mount.source.display(),
+                target.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn ensure_directory(path: &Path) -> Result<()> {
+    if path.exists() {
+        let metadata =
+            fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        if metadata.is_dir() {
+            return Ok(());
+        }
+        return Err(anyhow!("{} must be a directory", path.display()));
+    }
+
+    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
+}
+
+fn replace_with_symlink(source: &Path, target: &Path) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(target) {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || file_type.is_file() {
+            fs::remove_file(target).with_context(|| format!("remove {}", target.display()))?;
+        } else if metadata.is_dir() {
+            fs::remove_dir_all(target).with_context(|| format!("remove {}", target.display()))?;
+        } else {
+            return Err(anyhow!(
+                "cannot replace unsupported target type at {}",
+                target.display()
+            ));
+        }
+    }
+
+    unix_fs::symlink(source, target)
+        .with_context(|| format!("symlink {} -> {}", target.display(), source.display()))
 }

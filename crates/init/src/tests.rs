@@ -1,5 +1,7 @@
 use super::*;
 use anyhow::{anyhow, Context, Result};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use protocol::{
     AttestationPayload, ControlFrame, VmState, CONTROL_ACCESS_TOKEN, CONTROL_ATTESTATION,
     CONTROL_ERROR, CONTROL_PROVISION_ROOTFS, CONTROL_PROVISION_ROOTFS_URL,
@@ -46,7 +48,8 @@ async fn cold_provisioning_resets_existing_rootfs() -> Result<()> {
     let root_dir = temp.path().join("root");
     std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
     std::fs::create_dir_all(&root_dir).with_context(|| format!("create {}", root_dir.display()))?;
-    let stale = root_dir.join("stale.txt");
+    let stale = root_dir.join("etc/stale.txt");
+    std::fs::create_dir_all(stale.parent().unwrap()).context("create stale parent")?;
     std::fs::write(&stale, "old").context("write stale file")?;
 
     let mut setup = setup::SetupManager::new(
@@ -57,13 +60,38 @@ async fn cold_provisioning_resets_existing_rootfs() -> Result<()> {
     )?;
 
     setup
-        .setup_and_prepare(Some(vec![1, 2, 3]))
+        .setup_and_prepare(Some(test_rootfs("v1")?))
         .await
         .context("cold provision")?;
 
     assert!(
         !stale.exists(),
         "rootfs dir should be reset before provisioning"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_dir.join("etc/rootfs-version"))
+            .context("read version after cold provision")?,
+        "v1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_dir.join("root/.profile"))
+            .context("read persisted /root content")?,
+        "root profile v1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_dir.join("home/dev/welcome.txt"))
+            .context("read persisted /home content")?,
+        "home welcome v1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("persist/root/.profile"))
+            .context("read root backing dir")?,
+        "root profile v1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("persist/home/dev/welcome.txt"))
+            .context("read home backing dir")?,
+        "home welcome v1"
     );
     assert!(data_dir.join(".provisioned").exists());
     Ok(())
@@ -84,22 +112,44 @@ async fn reprovisioning_kills_runtime_and_resets_rootfs() -> Result<()> {
         true, // test_mode
     )?;
     setup
-        .setup_and_prepare(Some(vec![1, 2, 3]))
+        .setup_and_prepare(Some(test_rootfs("v1")?))
         .await
         .context("initial provision")?;
     assert!(setup.runtime_started());
 
-    let stale = root_dir.join("stale.txt");
+    let persisted_root = root_dir.join("root/persisted.txt");
+    std::fs::write(&persisted_root, "keep root").context("write persisted root file")?;
+    let persisted_home = root_dir.join("home/dev/project.txt");
+    std::fs::create_dir_all(persisted_home.parent().unwrap())
+        .context("create persisted home parent")?;
+    std::fs::write(&persisted_home, "keep home").context("write persisted home file")?;
+    let stale = root_dir.join("etc/transient.txt");
+    std::fs::create_dir_all(stale.parent().unwrap()).context("create stale parent")?;
     std::fs::write(&stale, "old").context("write stale file")?;
 
     setup
-        .setup_and_prepare(Some(vec![4, 5, 6]))
+        .setup_and_prepare(Some(test_rootfs("v2")?))
         .await
         .context("reprovision")?;
 
+    assert_eq!(
+        std::fs::read_to_string(&persisted_root)
+            .context("read persisted root after reprovision")?,
+        "keep root"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&persisted_home)
+            .context("read persisted home after reprovision")?,
+        "keep home"
+    );
     assert!(
         !stale.exists(),
-        "rootfs dir should be reset before reprovisioning"
+        "non-persistent rootfs content should be reset before reprovisioning"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_dir.join("etc/rootfs-version"))
+            .context("read version after reprovision")?,
+        "v2"
     );
     assert!(setup.runtime_started(), "runtime should be started again");
     assert!(data_dir.join(".provisioned").exists());
@@ -121,7 +171,7 @@ async fn cold_boot_to_ready_and_reconnect() -> Result<()> {
     provision_cold(
         &conn,
         "test-access-token",
-        ControlRootfs::Inline(b"fake-rootfs".to_vec()),
+        ControlRootfs::Inline(test_rootfs("cold-reconnect")?),
     )
     .await?;
 
@@ -147,7 +197,7 @@ async fn cold_boot_with_rootfs_url() -> Result<()> {
     let shared = shared_state_for_args(&args, Some("test-access-token".to_string())).await?;
     let server = tokio::spawn(quic::serve(args.clone(), shared));
 
-    let (rootfs_url, rootfs_server) = spawn_rootfs_http_server(b"fake-rootfs".to_vec()).await?;
+    let (rootfs_url, rootfs_server) = spawn_rootfs_http_server(test_rootfs("cold-url")?).await?;
 
     let endpoint = test_endpoint()?;
     let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
@@ -180,7 +230,7 @@ async fn cold_boot_rejected_without_access_token() -> Result<()> {
     let att = request_attestation(&mut send, &mut recv).await?;
     assert_eq!(att.state, VmState::Cold);
 
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs".to_vec())
+    ControlFrame::new(CONTROL_PROVISION_ROOTFS, test_rootfs("missing-token")?)
         .write_to(&mut send)
         .await
         .context("send rootfs")?;
@@ -249,7 +299,7 @@ async fn ready_rejects_wrong_access_token() -> Result<()> {
     provision_cold(
         &conn,
         "test-access-token",
-        ControlRootfs::Inline(b"fake-rootfs".to_vec()),
+        ControlRootfs::Inline(test_rootfs("ready-wrong-token")?),
     )
     .await?;
 
@@ -317,7 +367,7 @@ async fn ready_reprovision_with_access_token() -> Result<()> {
     provision_cold(
         &conn,
         "test-access-token",
-        ControlRootfs::Inline(b"fake-rootfs-v1".to_vec()),
+        ControlRootfs::Inline(test_rootfs("ready-reprovision-v1")?),
     )
     .await?;
 
@@ -325,10 +375,13 @@ async fn ready_reprovision_with_access_token() -> Result<()> {
     let att2 = request_attestation(&mut send2, &mut recv2).await?;
     assert_eq!(att2.state, VmState::Ready);
 
-    ControlFrame::new(CONTROL_PROVISION_ROOTFS, b"fake-rootfs-v2".to_vec())
-        .write_to(&mut send2)
-        .await
-        .context("send reprovision rootfs")?;
+    ControlFrame::new(
+        CONTROL_PROVISION_ROOTFS,
+        test_rootfs("ready-reprovision-v2")?,
+    )
+    .write_to(&mut send2)
+    .await
+    .context("send reprovision rootfs")?;
     ControlFrame::new(CONTROL_ACCESS_TOKEN, b"test-access-token".to_vec())
         .write_to(&mut send2)
         .await
@@ -526,6 +579,40 @@ async fn spawn_rootfs_http_server(body: Vec<u8>) -> Result<(String, tokio::task:
     });
 
     Ok((url, handle))
+}
+
+fn test_rootfs(version: &str) -> Result<Vec<u8>> {
+    let root_profile = format!("root profile {version}");
+    let home_welcome = format!("home welcome {version}");
+    rootfs_archive(&[
+        ("etc/rootfs-version", version.as_bytes()),
+        ("root/.profile", root_profile.as_bytes()),
+        ("home/dev/welcome.txt", home_welcome.as_bytes()),
+    ])
+}
+
+fn rootfs_archive(entries: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+
+    for (path, contents) in entries {
+        let mut header = tar::Header::new_gnu();
+        header
+            .set_path(path)
+            .with_context(|| format!("set tar path {path}"))?;
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append(&header, &mut std::io::Cursor::new(*contents))
+            .with_context(|| format!("append tar entry {path}"))?;
+    }
+
+    builder.finish().context("finish tar builder")?;
+    let encoder = builder
+        .into_inner()
+        .context("extract gzip encoder from tar builder")?;
+    encoder.finish().context("finish gzip encoder")
 }
 
 #[derive(Debug)]

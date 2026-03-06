@@ -8,7 +8,7 @@ Current model:
 
 - Attestation: client verifies Fly OIDC JWT (`iss`, `aud`, `app_name`) bound to TLS exporter material.
 - Authentication: one shared `ACCESS_TOKEN` for both first-time provisioning and reconnect.
-- Storage: rootfs is extracted directly onto the Fly volume at `/data/rootfs` (no client-side disk encryption).
+- Storage: rootfs is extracted directly onto the Fly volume at `/data/rootfs`, while `/root` and `/home` are preserved separately under `/data/persist` across reprovisioning (no client-side disk encryption).
 
 Important trade-off: persisted data is not encrypted with a client-held key. Fly platform operators with sufficient infrastructure access can read data at rest.
 
@@ -31,8 +31,8 @@ Workspace crates:
 
 Transitions:
 
-- `Cold -> Ready`: valid `ACCESS_TOKEN` and rootfs payload accepted, rootfs extracted, provisioning marker written.
-- `Ready -> Ready`: reconnect with valid `ACCESS_TOKEN`; optional reprovision with new rootfs payload.
+- `Cold -> Ready`: valid `ACCESS_TOKEN` and rootfs payload accepted, rootfs extracted, persistent `/root` and `/home` prepared, provisioning marker written.
+- `Ready -> Ready`: reconnect with valid `ACCESS_TOKEN`; optional reprovision with new rootfs payload while preserving `/root` and `/home`.
 
 ## 4. Control Protocol
 
@@ -54,7 +54,7 @@ Control frames used by the provisioning/auth flow:
 2. Client sends `CONTROL_ACCESS_TOKEN`.
 3. `init` checks token against `ACCESS_TOKEN` environment variable.
 4. Client sends rootfs (`CONTROL_PROVISION_ROOTFS` or URL variant).
-5. `init` extracts rootfs, writes `/data/.provisioned`, enters `Ready`.
+5. `init` extracts rootfs, preserves `/root` and `/home` from `/data/persist`, writes `/data/.provisioned`, enters `Ready`.
 
 ### 5.2 Reconnect (Ready)
 
@@ -67,7 +67,7 @@ Control frames used by the provisioning/auth flow:
 
 1. Client authenticates with `CONTROL_ACCESS_TOKEN` as above.
 2. Client sends new rootfs payload.
-3. `init` extracts new rootfs and returns `CONTROL_SETUP_COMPLETE`.
+3. `init` extracts new rootfs in place, reattaches persistent `/root` and `/home`, and returns `CONTROL_SETUP_COMPLETE`.
 
 ## 6. Setup Manager Behavior
 
@@ -75,6 +75,7 @@ Control frames used by the provisioning/auth flow:
 
 - Detects state from `.provisioned`.
 - Extracts rootfs tarball into configured root mount dir (`/data/rootfs` by default).
+- Preserves `/root` and `/home` outside the extracted root and mounts them back into the VM root on boot.
 - Optionally launches inner init in PID+mount namespaces when running outside test mode.
 
 ## 7. Configuration

@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         setup,
         access_token,
         console: Arc::new(forward::SharedConsoleManager::new()),
-        exec_sessions: Arc::new(forward::ExecSessionManager::new()),
+        exec_sessions: forward::ExecSessionManager::new_arced(),
     }));
 
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;

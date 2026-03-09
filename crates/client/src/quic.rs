@@ -1,6 +1,7 @@
 use crate::attest;
 use crate::cache::{AttestationCache, CacheEntry};
 use crate::console;
+use crate::control;
 use crate::forward;
 use crate::proxy_udp::ProxyUdpSocket;
 use crate::{TransportConfig, VaultConfig};
@@ -29,17 +30,32 @@ pub async fn connect_and_run(
     cfg: VaultConfig,
     forwards: Vec<String>,
     reprovision: bool,
+    control_socket: Option<PathBuf>,
 ) -> Result<()> {
-    if forwards.is_empty() {
+    if forwards.is_empty() && control_socket.is_none() {
         run_console_with_reconnect(&cfg, reprovision).await?;
     } else {
         let conn = connect_ready(&cfg, reprovision).await?;
+
         let console_conn = conn.clone();
         tokio::spawn(async move {
             let _ = console::run_console(console_conn, 0).await;
         });
 
-        forward::run_local_forwarders(conn, forwards).await?;
+        if let Some(path) = control_socket {
+            let control_conn = conn.clone();
+            tokio::spawn(async move {
+                if let Err(err) = control::serve(control_conn, path).await {
+                    warn!(error = %err, "control socket exited");
+                }
+            });
+        }
+
+        if forwards.is_empty() {
+            tokio::signal::ctrl_c().await?;
+        } else {
+            forward::run_local_forwarders(conn, forwards).await?;
+        }
     }
 
     Ok(())
@@ -140,7 +156,7 @@ async fn run_exec_with_reconnect(
     }
 }
 
-fn generate_exec_session_id() -> String {
+pub(crate) fn generate_exec_session_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)

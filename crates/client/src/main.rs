@@ -1,6 +1,7 @@
 mod attest;
 mod cache;
 mod console;
+mod control;
 mod forward;
 mod proxy_udp;
 mod quic;
@@ -32,6 +33,9 @@ enum Command {
         /// Re-provision the vault with a new rootfs while in ready state.
         #[arg(long)]
         reprovision: bool,
+        /// Expose a local HTTP control API on a Unix socket at this path.
+        #[arg(long = "control-socket")]
+        control_socket: Option<PathBuf>,
     },
     Exec {
         vault: String,
@@ -96,6 +100,7 @@ async fn main() -> Result<()> {
             vault,
             forward,
             reprovision,
+            control_socket,
         } => {
             let (_, mut cfg_file) = load_config_file()?;
             let vault_cfg = resolve_vault_config(&mut cfg_file, &vault)?;
@@ -106,7 +111,7 @@ async fn main() -> Result<()> {
                 forward
             };
 
-            quic::connect_and_run(vault_cfg, forwards, reprovision).await?;
+            quic::connect_and_run(vault_cfg, forwards, reprovision, control_socket).await?;
         }
         Command::Exec {
             vault,

@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -117,14 +118,34 @@ impl SharedConsoleManager {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExecSessionManager {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
 }
 
+const COMPLETED_SESSION_TTL: Duration = Duration::from_secs(60);
+
 impl ExecSessionManager {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new_arced() -> Arc<Self> {
+        let manager = Arc::new(Self {
+            sessions: Mutex::new(HashMap::new()),
+        });
+        tokio::spawn(Self::reap_completed_sessions(Arc::clone(&manager)));
+        manager
+    }
+
+    async fn reap_completed_sessions(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut guard = self.sessions.lock().await;
+            guard.retain(|_, session| {
+                let exited_at = session.runtime.exited_at.lock().unwrap();
+                match *exited_at {
+                    Some(t) => t.elapsed() < COMPLETED_SESSION_TTL,
+                    None => true,
+                }
+            });
+        }
     }
 
     pub async fn attach_or_create(
@@ -427,6 +448,7 @@ struct PersistentConsoleRuntime {
     input_tx: mpsc::Sender<ConsoleInput>,
     output: Arc<BufferedConsoleOutput>,
     exit_code: Arc<StdMutex<Option<u32>>>,
+    exited_at: Arc<StdMutex<Option<Instant>>>,
 }
 
 #[derive(Debug)]
@@ -606,6 +628,7 @@ fn spawn_persistent_console(
         DETACHED_OUTPUT_BUFFER_LIMIT_BYTES,
     ));
     let exit_code = Arc::new(StdMutex::new(None));
+    let exited_at = Arc::new(StdMutex::new(None));
     let shutdown = CancellationToken::new();
 
     tokio::spawn(run_persistent_console_input(
@@ -625,6 +648,7 @@ fn spawn_persistent_console(
         Arc::clone(&output),
         shutdown,
         Arc::clone(&exit_code),
+        Arc::clone(&exited_at),
         wait_label,
     ));
 
@@ -632,6 +656,7 @@ fn spawn_persistent_console(
         input_tx,
         output,
         exit_code,
+        exited_at,
     })
 }
 
@@ -702,6 +727,7 @@ async fn wait_for_persistent_console_exit(
     output: Arc<BufferedConsoleOutput>,
     shutdown: CancellationToken,
     exit_code: Arc<StdMutex<Option<u32>>>,
+    exited_at: Arc<StdMutex<Option<Instant>>>,
     wait_label: &'static str,
 ) {
     let code = match child.wait().await {
@@ -715,6 +741,10 @@ async fn wait_for_persistent_console_exit(
     {
         let mut guard = exit_code.lock().unwrap();
         *guard = Some(code);
+    }
+    {
+        let mut guard = exited_at.lock().unwrap();
+        *guard = Some(Instant::now());
     }
 
     output.push_exit(code);
@@ -1111,6 +1141,7 @@ mod tests {
                 input_tx: mpsc::channel(1).0,
                 output: Arc::new(BufferedConsoleOutput::new(1024)),
                 exit_code: Arc::new(StdMutex::new(None)),
+                exited_at: Arc::new(StdMutex::new(None)),
             },
             attachment: Mutex::new(ExecAttachmentState::default()),
             owner: std::sync::Weak::new(),

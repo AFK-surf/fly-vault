@@ -51,6 +51,63 @@ pub async fn run_exec(
     .await
 }
 
+/// Run an exec session non-interactively, streaming output through `output_tx`.
+/// Returns the exit code when the remote process exits.
+/// No terminal handling (no raw mode, no resize, no stdin).
+pub async fn run_exec_streaming(
+    conn: quinn::Connection,
+    request: ExecSessionRequest,
+    output_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+) -> Result<u32> {
+    let (mut send, mut recv) = conn.open_bi().await.context("open exec stream")?;
+    send.write_u8(STREAM_CONSOLE)
+        .await
+        .context("write console stream tag")?;
+    ConsoleFrame::new(CONSOLE_EXEC, request.to_bytes())
+        .write_to(&mut send)
+        .await
+        .context("write exec startup frame")?;
+
+    // Keep `send` alive — finishing or dropping it signals EOF/RESET to the
+    // remote, which would tear down the session before output arrives.
+    let exit_code = loop {
+        let frame = ConsoleFrame::read_from(&mut recv)
+            .await
+            .context("read exec frame")?;
+        match frame.ty {
+            CONSOLE_DATA => {
+                if output_tx
+                    .send(bytes::Bytes::from(frame.payload))
+                    .await
+                    .is_err()
+                {
+                    // HTTP client disconnected
+                    break decode_exit(&wait_for_exit(&mut recv).await?)?;
+                }
+            }
+            CONSOLE_EXIT => {
+                break decode_exit(&frame.payload)?;
+            }
+            _ => {}
+        }
+    };
+
+    let _ = send.finish();
+    Ok(exit_code)
+}
+
+/// Drain frames until a CONSOLE_EXIT arrives, returning its payload.
+async fn wait_for_exit(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    loop {
+        let frame = ConsoleFrame::read_from(recv)
+            .await
+            .context("read exec frame while waiting for exit")?;
+        if frame.ty == CONSOLE_EXIT {
+            return Ok(frame.payload);
+        }
+    }
+}
+
 pub fn build_exec_request(
     session_id: String,
     argv: Option<Vec<String>>,

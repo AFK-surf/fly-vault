@@ -249,9 +249,53 @@ cache under the OS cache directory and treats it as disposable local state.
 After startup, the process removes `ACCESS_TOKEN` from the environment with
 `std::env::remove_var`.
 
-## 8. Admin And Proxy Notes
+## 8. Control Socket API
 
-### 8.1 Admin
+When `fly-vault connect --control-socket <path>` is used, the client exposes an
+HTTP/1.1 API over a Unix domain socket. This lets other local processes reuse the
+established QUIC session without performing their own attestation handshake.
+
+Endpoints:
+
+- `POST /exec` — run a command on the vault. Request body is JSON:
+
+  ```json
+  {
+    "command": ["ls", "-la", "/"],
+    "session_id": "optional-custom-id",
+    "context": "optional audit context"
+  }
+  ```
+
+  The response streams raw command output as `application/octet-stream` with
+  chunked transfer encoding. The `X-Session-Id` header identifies the session.
+
+- `GET /list-exec` — list all exec sessions. Returns a JSON array of
+  `ExecSessionInfo` objects (same schema as `fly-vault list-exec`).
+
+The control socket server shares the QUIC connection established by `connect`.
+Each HTTP request opens its own QUIC stream, so multiple concurrent exec
+sessions are supported. If the QUIC connection is lost, in-flight HTTP requests
+receive a 502 error.
+
+## 9. Exec Session Lifecycle
+
+Exec sessions are managed by `ExecSessionManager` inside `init`. Each session
+is a persistent PTY process identified by a `session_id`.
+
+- **Creation**: a `CONSOLE_EXEC` frame with `argv` spawns a new session.
+- **Reconnection**: a `CONSOLE_EXEC` frame with the same `session_id` and
+  `argv=None` reattaches to an existing session, replaying buffered output from
+  `rendered_bytes`.
+- **Detach cleanup**: when a client disconnects from an exited session, it is
+  removed immediately.
+- **TTL cleanup**: a background reaper removes exited sessions that have had no
+  client attachment for 60 seconds. This prevents unbounded accumulation when
+  clients never reconnect after a session exits.
+
+## 10. Admin And Proxy Notes
+
+### 10.1 Admin
 
 `fly-vault-admin`:
 
@@ -261,7 +305,7 @@ After startup, the process removes `ACCESS_TOKEN` from the environment with
 - preserves cleanup errors when tenant creation partially succeeds
 - uses structured HTTP-status handling for Machines API wait timeouts
 
-### 8.2 Proxy
+### 10.2 Proxy
 
 `vault-proxy`:
 
@@ -270,7 +314,7 @@ After startup, the process removes `ACCESS_TOKEN` from the environment with
   panicking the process
 - keeps a lightweight machine-state cache for routing/start decisions
 
-## 9. Limitations And Risks
+## 11. Limitations And Risks
 
 - No client-held disk encryption.
 - No strict digest allowlist or machine-config verification yet.
@@ -283,7 +327,7 @@ After startup, the process removes `ACCESS_TOKEN` from the environment with
 - Fallback init is a degraded recovery path, not a full substitute for a
   healthy `/sbin/init`.
 
-## 10. Operational Notes
+## 12. Operational Notes
 
 Recommended checks after changes:
 

@@ -41,7 +41,11 @@ pub async fn run_local_forwarders(conn: quinn::Connection, specs: Vec<String>) -
     Ok(())
 }
 
-async fn bridge_one(conn: quinn::Connection, local: TcpStream, target: String) -> Result<()> {
+pub(crate) async fn bridge_one(
+    conn: quinn::Connection,
+    local: TcpStream,
+    target: String,
+) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("open forward stream")?;
     send.write_u8(STREAM_PORT_FORWARD)
         .await
@@ -94,7 +98,7 @@ async fn bridge_one(conn: quinn::Connection, local: TcpStream, target: String) -
     Ok(())
 }
 
-fn parse_forward(spec: &str) -> Result<(u16, String)> {
+pub(crate) fn parse_forward(spec: &str) -> Result<(u16, String)> {
     let parts: Vec<&str> = spec.split(':').collect();
     if parts.len() != 3 {
         return Err(anyhow!(

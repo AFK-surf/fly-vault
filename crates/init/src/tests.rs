@@ -732,7 +732,7 @@ async fn shared_state_for_args(
         setup,
         access_token,
         console: Arc::new(forward::SharedConsoleManager::new()),
-        exec_sessions: Arc::new(forward::ExecSessionManager::new()),
+        exec_sessions: forward::ExecSessionManager::new_arced(),
     })))
 }
 

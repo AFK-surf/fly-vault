@@ -1,0 +1,342 @@
+openapi: 3.1.0
+info:
+  title: fly-vault Control Socket API
+  version: 0.1.0
+  description: |
+    HTTP/1.1 API exposed over a Unix domain socket by `fly-vault connect --control-socket <path>`.
+    Allows local processes to execute commands and list exec sessions on the
+    connected vault without establishing their own QUIC session.
+
+    All requests are made over the Unix socket. The `host` header value is
+    ignored; `localhost` is conventional.
+
+    Example:
+    ```
+    curl --unix-socket /tmp/vault.sock http://localhost/list-exec
+    ```
+
+paths:
+  /exec:
+    post:
+      operationId: exec
+      summary: Execute a command on the vault
+      description: |
+        Starts a non-interactive exec session on the vault. The response body
+        streams raw command output bytes in real time using chunked transfer
+        encoding. The stream ends when the remote process exits.
+
+        If `session_id` matches an existing session, the client reattaches to
+        it (the `command` field is still required but ignored for reattach).
+        Otherwise a new session is created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+            examples:
+              simple:
+                summary: Run a simple command
+                value:
+                  command: ["ls", "-la", "/"]
+              withContext:
+                summary: Run with audit context
+                value:
+                  command: ["sh", "-c", "cat /etc/hostname"]
+                  context: "deploy health check"
+              withSessionId:
+                summary: Provide a custom session ID
+                value:
+                  command: ["tail", "-f", "/var/log/syslog"]
+                  session_id: "log-tail-1"
+                  context: "tailing logs"
+      responses:
+        "200":
+          description: |
+            Command output streamed as raw bytes. The connection remains open
+            until the remote process exits.
+          headers:
+            X-Session-Id:
+              description: Identifier for this exec session.
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid request (malformed JSON, empty command).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                emptyCommand:
+                  value:
+                    error: "command must not be empty"
+                badJson:
+                  value:
+                    error: "invalid json: EOF while parsing a value at line 1 column 0"
+        "502":
+          description: The upstream QUIC connection to the vault failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /list-exec:
+    get:
+      operationId: listExec
+      summary: List exec sessions
+      description: |
+        Returns all exec sessions known to the vault, including running and
+        recently completed sessions. Completed sessions are removed
+        automatically after 60 seconds.
+      responses:
+        "200":
+          description: Array of exec session info objects.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ExecSessionInfo"
+              examples:
+                mixed:
+                  summary: One running and one completed session
+                  value:
+                    - session_id: "a1b2c3d4e5f6"
+                      argv: ["tail", "-f", "/var/log/syslog"]
+                      context: "tailing logs"
+                      attached: true
+                      exit_code: null
+                    - session_id: "f6e5d4c3b2a1"
+                      argv: ["ls", "-la", "/"]
+                      context: null
+                      attached: false
+                      exit_code: 0
+        "502":
+          description: The upstream QUIC connection to the vault failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /forwards:
+    post:
+      operationId: createForward
+      summary: Create a port forward
+      description: |
+        Starts a new local TCP listener that forwards connections to the
+        specified target on the vault over the QUIC session. The forward
+        persists until explicitly deleted or the `fly-vault connect` process
+        exits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateForwardRequest"
+            examples:
+              web:
+                summary: Forward local 8080 to remote localhost:3000
+                value:
+                  spec: "8080:localhost:3000"
+              database:
+                summary: Forward local 5432 to remote db:5432
+                value:
+                  spec: "5432:db:5432"
+      responses:
+        "200":
+          description: Forward created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForwardInfo"
+              example:
+                local_port: 8080
+                target: "localhost:3000"
+        "400":
+          description: Invalid spec or unable to bind the local port.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                badSpec:
+                  value:
+                    error: "invalid --forward spec foo; expected <local_port>:<target_host>:<target_port>"
+                bindFailed:
+                  value:
+                    error: "bind local port 8080: Address already in use (os error 48)"
+        "409":
+          description: A forward on this local port already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "forward on port 8080 already exists"
+    get:
+      operationId: listForwards
+      summary: List active port forwards
+      description: |
+        Returns all port forwards currently managed by this control socket,
+        sorted by local port.
+      responses:
+        "200":
+          description: Array of active forwards.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ForwardInfo"
+              example:
+                - local_port: 5432
+                  target: "db:5432"
+                - local_port: 8080
+                  target: "localhost:3000"
+    delete:
+      operationId: deleteForward
+      summary: Delete a port forward
+      description: |
+        Stops a port forward by local port. The local TCP listener is closed
+        and any in-flight connections are terminated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteForwardRequest"
+            example:
+              local_port: 8080
+      responses:
+        "200":
+          description: Forward deleted successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForwardInfo"
+              example:
+                local_port: 8080
+                target: "localhost:3000"
+        "400":
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No forward on the specified port.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "no forward on port 8080"
+
+components:
+  schemas:
+    ExecRequest:
+      type: object
+      required:
+        - command
+      properties:
+        command:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: Command argv to execute (first element is the program).
+          examples:
+            - ["ls", "-la", "/"]
+        session_id:
+          type: string
+          description: |
+            Optional session identifier. If omitted, a random 32-character
+            hex ID is generated. If it matches an existing session, the client
+            reattaches to that session.
+        context:
+          type: string
+          description: Optional audit/debug context string stored with the session.
+
+    ExecSessionInfo:
+      type: object
+      required:
+        - session_id
+        - argv
+        - context
+        - attached
+        - exit_code
+      properties:
+        session_id:
+          type: string
+          description: Unique identifier for this exec session.
+        argv:
+          type: array
+          items:
+            type: string
+          description: The command and arguments that were executed.
+        context:
+          type: string
+          nullable: true
+          description: Audit context provided when the session was created.
+        attached:
+          type: boolean
+          description: Whether a client is currently attached to this session.
+        exit_code:
+          type: integer
+          format: uint32
+          nullable: true
+          description: |
+            Exit code of the process, or null if still running.
+
+    CreateForwardRequest:
+      type: object
+      required:
+        - spec
+      properties:
+        spec:
+          type: string
+          description: |
+            Forward specification in `<local_port>:<target_host>:<target_port>`
+            format. The local port is bound on 127.0.0.1. The target address is
+            resolved on the vault.
+          examples:
+            - "8080:localhost:3000"
+            - "5432:db:5432"
+
+    DeleteForwardRequest:
+      type: object
+      required:
+        - local_port
+      properties:
+        local_port:
+          type: integer
+          format: uint16
+          description: Local port of the forward to delete.
+
+    ForwardInfo:
+      type: object
+      required:
+        - local_port
+        - target
+      properties:
+        local_port:
+          type: integer
+          format: uint16
+          description: Local port the forward listens on (127.0.0.1).
+        target:
+          type: string
+          description: Target address on the vault (host:port).
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.

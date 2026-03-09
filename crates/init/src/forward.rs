@@ -14,7 +14,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -340,47 +340,51 @@ struct ExecAttachmentState {
 struct BufferedConsoleOutput {
     limit_bytes: usize,
     state: StdMutex<BufferedConsoleState>,
-    live_tx: broadcast::Sender<ConsoleOutputEvent>,
+    notify_tx: watch::Sender<u64>,
 }
 
 impl BufferedConsoleOutput {
     fn new(limit_bytes: usize) -> Self {
-        let (live_tx, _) = broadcast::channel(128);
+        let (notify_tx, _) = watch::channel(0u64);
         Self {
             limit_bytes,
             state: StdMutex::new(BufferedConsoleState::default()),
-            live_tx,
+            notify_tx,
         }
     }
 
     fn subscribe_from(&self, rendered_bytes: u64) -> BufferedConsoleSubscription {
-        let live_rx = self.live_tx.subscribe();
-        let (replay, next_offset) = self.replay_from(rendered_bytes);
+        let notify_rx = self.notify_tx.subscribe();
+        let state = self.state.lock().unwrap();
+        let next_offset = state.next_offset;
+        let replay_from = rendered_bytes.clamp(state.retained_start, next_offset);
+        let skip = (replay_from - state.retained_start) as usize;
+        let replay: Vec<u8> = state.buffer.iter().skip(skip).copied().collect();
         BufferedConsoleSubscription {
             replay,
             next_offset,
-            live_rx,
+            notify_rx,
         }
     }
 
-    fn replay_from(&self, rendered_bytes: u64) -> (Vec<u8>, u64) {
+    fn replay_from(&self, offset: u64) -> (Vec<u8>, u64) {
         let state = self.state.lock().unwrap();
-        state.replay_from(rendered_bytes)
+        state.replay_from(offset)
     }
 
     fn push_data(&self, payload: &[u8]) {
-        let start_offset = {
+        let next_offset = {
             let mut state = self.state.lock().unwrap();
-            state.push(payload, self.limit_bytes)
+            state.push(payload, self.limit_bytes);
+            state.next_offset
         };
-        let _ = self.live_tx.send(ConsoleOutputEvent::Data {
-            start_offset,
-            payload: payload.to_vec(),
-        });
+        self.notify_tx.send_modify(|v| *v = next_offset);
     }
 
-    fn push_exit(&self, code: u32) {
-        let _ = self.live_tx.send(ConsoleOutputEvent::Exit(code));
+    fn push_exit(&self, _code: u32) {
+        // Exit is detected via the exit_code mutex; just bump the watch
+        // so any waiters wake up and can check.
+        self.notify_tx.send_modify(|v| *v = *v);
     }
 }
 
@@ -430,17 +434,11 @@ impl BufferedConsoleState {
     }
 }
 
-#[derive(Clone, Debug)]
-enum ConsoleOutputEvent {
-    Data { start_offset: u64, payload: Vec<u8> },
-    Exit(u32),
-}
-
 #[derive(Debug)]
 struct BufferedConsoleSubscription {
     replay: Vec<u8>,
     next_offset: u64,
-    live_rx: broadcast::Receiver<ConsoleOutputEvent>,
+    notify_rx: watch::Receiver<u64>,
 }
 
 #[derive(Debug)]
@@ -799,52 +797,34 @@ async fn stream_console_output(
     }
 
     loop {
-        let event = if let Some(takeover) = takeover {
+        let changed = if let Some(takeover) = takeover {
             tokio::select! {
                 _ = takeover.cancelled() => break,
-                result = subscription.live_rx.recv() => result,
+                result = subscription.notify_rx.changed() => result,
             }
         } else {
-            subscription.live_rx.recv().await
+            subscription.notify_rx.changed().await
         };
 
-        match event {
-            Ok(ConsoleOutputEvent::Data {
-                start_offset,
-                payload,
-            }) => {
-                let end_offset = start_offset.saturating_add(payload.len() as u64);
-                if end_offset <= next_offset {
-                    continue;
-                }
-                let skip = next_offset.saturating_sub(start_offset) as usize;
-                send_console_bytes(send, &payload[skip..]).await?;
-                next_offset = end_offset;
-            }
-            Ok(ConsoleOutputEvent::Exit(code)) => {
+        if changed.is_err() {
+            // Sender dropped — drain remaining data.
+            let (replay, _) = output.replay_from(next_offset);
+            send_console_bytes(send, &replay).await?;
+            if let Some(code) = read_exit_code(exit_code) {
                 write_exit_frame(send, code).await?;
                 send.finish().context(finish_context)?;
-                break;
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                let (replay, replay_end) = output.replay_from(next_offset);
-                send_console_bytes(send, &replay).await?;
-                next_offset = replay_end;
-                if let Some(code) = read_exit_code(exit_code) {
-                    write_exit_frame(send, code).await?;
-                    send.finish().context(finish_context)?;
-                    break;
-                }
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                let (replay, _) = output.replay_from(next_offset);
-                send_console_bytes(send, &replay).await?;
-                if let Some(code) = read_exit_code(exit_code) {
-                    write_exit_frame(send, code).await?;
-                    send.finish().context(finish_context)?;
-                }
-                break;
-            }
+            break;
+        }
+
+        let (data, new_offset) = output.replay_from(next_offset);
+        send_console_bytes(send, &data).await?;
+        next_offset = new_offset;
+
+        if let Some(code) = read_exit_code(exit_code) {
+            write_exit_frame(send, code).await?;
+            send.finish().context(finish_context)?;
+            break;
         }
     }
 

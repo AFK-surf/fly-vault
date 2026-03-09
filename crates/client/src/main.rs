@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::File;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "fly-vault")]
 struct Cli {
+    #[arg(long, global = true, env = "FLY_VAULT_LOG_FILE")]
+    log_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -85,15 +88,9 @@ impl VaultConfig {
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+    init_logging(cli.log_file.as_ref())?;
+
     match cli.command {
         Command::Connect {
             vault,
@@ -153,6 +150,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn init_logging(log_file: Option<&PathBuf>) -> Result<()> {
+    let Some(log_file) = log_file else {
+        return Ok(());
+    };
+
+    if let Some(parent) = log_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create log directory {}", parent.display()))?;
+    }
+
+    let file =
+        File::create(log_file).with_context(|| format!("open log file {}", log_file.display()))?;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .with_writer(move || {
+            file.try_clone()
+                .expect("clone log file handle for tracing output")
+        })
+        .init();
+
+    Ok(())
+}
+
 fn run_build_commands() -> Result<()> {
     use std::process::Command;
 
@@ -203,6 +231,7 @@ mod tests {
     use super::{resolve_vault_config, Cli, Command, ConfigFile, TransportConfig, VaultConfig};
     use clap::Parser;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn vault_config_deserializes_with_machine_id() {
@@ -351,6 +380,33 @@ app = "my-app"
                     .map(|arg| arg.into_string().unwrap())
                     .collect::<Vec<_>>();
                 assert_eq!(command, vec!["sh"]);
+            }
+            other => panic!("expected exec command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_log_file_parses_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "fly-vault",
+            "exec",
+            "--log-file",
+            "/tmp/fly-vault.log",
+            "my-dev",
+            "--",
+            "true",
+        ])
+        .expect("parse exec command with global log file");
+
+        assert_eq!(cli.log_file, Some(PathBuf::from("/tmp/fly-vault.log")));
+        match cli.command {
+            Command::Exec { vault, command, .. } => {
+                assert_eq!(vault, "my-dev");
+                let command = command
+                    .into_iter()
+                    .map(|arg| arg.into_string().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(command, vec!["true"]);
             }
             other => panic!("expected exec command, got {other:?}"),
         }

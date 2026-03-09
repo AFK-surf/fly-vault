@@ -210,7 +210,7 @@ async fn run_session(
     });
 
     let session_result: Result<ConsoleSessionOutcome> = async {
-        let mut stdout = tokio::io::stdout();
+        let mut stdout = std::io::stdout();
         loop {
             let frame = match ConsoleFrame::read_from(&mut recv).await {
                 Ok(frame) => frame,
@@ -289,40 +289,26 @@ async fn run_session(
     })
 }
 
-async fn write_console_output(stdout: &mut tokio::io::Stdout, payload: &[u8]) -> Result<()> {
+async fn write_console_output(stdout: &mut std::io::Stdout, payload: &[u8]) -> Result<()> {
     let mut written = 0;
     while written < payload.len() {
-        match stdout.write(&payload[written..]).await {
-            Ok(0) => {
-                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
-                    .context("write stdout");
-            }
-            Ok(n) => {
-                written += n;
-            }
-            Err(err) if is_retryable_stdout_error(&err) => {
-                tokio::task::yield_now().await;
-            }
-            Err(err) => return Err(err).context("write stdout"),
+        let slice = &payload[written..];
+        let ret = tokio::task::block_in_place(|| unsafe {
+            libc::write(stdout.as_raw_fd(), slice.as_ptr().cast(), slice.len())
+        });
+        if ret < 0 {
+            return Err(
+                anyhow::Error::from(std::io::Error::last_os_error()).context("write stdout")
+            );
         }
+        if ret == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                .context("write stdout");
+        }
+        written += ret as usize;
     }
 
-    loop {
-        match stdout.flush().await {
-            Ok(()) => return Ok(()),
-            Err(err) if is_retryable_stdout_error(&err) => {
-                tokio::task::yield_now().await;
-            }
-            Err(err) => return Err(err).context("flush stdout"),
-        }
-    }
-}
-
-fn is_retryable_stdout_error(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-    )
+    Ok(())
 }
 
 fn current_term_for_exec() -> Option<String> {
@@ -555,7 +541,7 @@ fn is_reconnectable_write_error(err: &quinn::WriteError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_reconnectable_transport, is_retryable_stdout_error, wrap_exec_with_term};
+    use super::{is_reconnectable_transport, wrap_exec_with_term};
     use anyhow::anyhow;
 
     #[test]
@@ -601,18 +587,5 @@ mod tests {
     fn reconnectable_transport_matches_connection_reset_io_errors() {
         let err = anyhow!(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert!(is_reconnectable_transport(&err));
-    }
-
-    #[test]
-    fn retryable_stdout_error_matches_would_block_and_interrupted() {
-        assert!(is_retryable_stdout_error(&std::io::Error::from(
-            std::io::ErrorKind::WouldBlock
-        )));
-        assert!(is_retryable_stdout_error(&std::io::Error::from(
-            std::io::ErrorKind::Interrupted
-        )));
-        assert!(!is_retryable_stdout_error(&std::io::Error::from(
-            std::io::ErrorKind::BrokenPipe
-        )));
     }
 }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote VM"
+  short_description: "Use the fly-vault CLI for remote VMs"
+  default_prompt: "Use $remote-vm to connect to or inspect a Fly vault VM with the fly-vault CLI."

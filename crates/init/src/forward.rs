@@ -2,9 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use nix::unistd::Pid;
 use protocol::{
     decode_resize, ConsoleFrame, ExecSessionInfo, ExecSessionList, ExecSessionRequest,
-    CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL,
+    SharedConsoleRequest, CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
@@ -16,6 +16,8 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+const DETACHED_OUTPUT_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
 
 pub async fn handle_port_forward_stream(
     mut send: quinn::SendStream,
@@ -80,7 +82,12 @@ impl SharedConsoleManager {
         Self::default()
     }
 
-    pub async fn attach(&self, root_dir: &Path, inner_pid: Pid) -> Result<SharedConsoleAttachment> {
+    pub async fn attach(
+        &self,
+        root_dir: &Path,
+        inner_pid: Pid,
+        rendered_bytes: u64,
+    ) -> Result<SharedConsoleAttachment> {
         loop {
             let session = {
                 let mut guard = self.session.lock().await;
@@ -94,7 +101,7 @@ impl SharedConsoleManager {
                 }
             };
 
-            let attachment = session.attach();
+            let attachment = session.attach(rendered_bytes);
             if !session.is_finished() {
                 return Ok(attachment);
             }
@@ -153,7 +160,7 @@ impl ExecSessionManager {
             }
         };
 
-        session.attach().await
+        session.attach(request.rendered_bytes).await
     }
 
     pub async fn list(&self) -> Vec<ExecSessionInfo> {
@@ -195,15 +202,15 @@ impl SharedConsoleSession {
                 root_dir,
                 inner_pid,
                 "shared console shell",
-                None,
             )?,
         })
     }
 
-    fn attach(&self) -> SharedConsoleAttachment {
+    fn attach(&self, rendered_bytes: u64) -> SharedConsoleAttachment {
         SharedConsoleAttachment {
             input_tx: self.runtime.input_tx.clone(),
-            output_rx: self.runtime.output_tx.subscribe(),
+            output: Arc::clone(&self.runtime.output),
+            output_subscription: self.runtime.output.subscribe_from(rendered_bytes),
             exit_code: Arc::clone(&self.runtime.exit_code),
         }
     }
@@ -220,6 +227,7 @@ struct ExecSession {
     context: Option<String>,
     runtime: PersistentConsoleRuntime,
     attachment: Mutex<ExecAttachmentState>,
+    owner: std::sync::Weak<ExecSessionManager>,
 }
 
 impl ExecSession {
@@ -240,13 +248,13 @@ impl ExecSession {
                 root_dir,
                 inner_pid,
                 "persistent exec session",
-                Some(ExecSessionCleanup { owner, session_id }),
             )?,
             attachment: Mutex::new(ExecAttachmentState::default()),
+            owner,
         })
     }
 
-    async fn attach(self: &Arc<Self>) -> Result<ExecSessionAttachment> {
+    async fn attach(self: &Arc<Self>, rendered_bytes: u64) -> Result<ExecSessionAttachment> {
         let mut state = self.attachment.lock().await;
         if let Some((_, token)) = state.current.take() {
             token.cancel();
@@ -259,14 +267,15 @@ impl ExecSession {
         Ok(ExecSessionAttachment {
             session: Arc::clone(self),
             input_tx: self.runtime.input_tx.clone(),
-            output_rx: self.runtime.output_tx.subscribe(),
+            output: Arc::clone(&self.runtime.output),
+            output_subscription: self.runtime.output.subscribe_from(rendered_bytes),
             exit_code: Arc::clone(&self.runtime.exit_code),
             takeover,
             generation,
         })
     }
 
-    async fn detach(&self, generation: u64) {
+    async fn detach(self: &Arc<Self>, generation: u64) {
         let mut state = self.attachment.lock().await;
         if state
             .current
@@ -274,6 +283,14 @@ impl ExecSession {
             .is_some_and(|(current, _)| *current == generation)
         {
             state.current = None;
+        }
+        let should_remove = read_exit_code(self.runtime.exit_code.as_ref()).is_some();
+        drop(state);
+
+        if should_remove {
+            if let Some(owner) = self.owner.upgrade() {
+                owner.remove_if_same(&self.session_id, self).await;
+            }
         }
     }
 
@@ -299,22 +316,124 @@ struct ExecAttachmentState {
 }
 
 #[derive(Debug)]
-struct PersistentConsoleRuntime {
-    input_tx: mpsc::Sender<ConsoleInput>,
-    output_tx: broadcast::Sender<ConsoleFrame>,
-    exit_code: Arc<StdMutex<Option<u32>>>,
+struct BufferedConsoleOutput {
+    limit_bytes: usize,
+    state: StdMutex<BufferedConsoleState>,
+    live_tx: broadcast::Sender<ConsoleOutputEvent>,
+}
+
+impl BufferedConsoleOutput {
+    fn new(limit_bytes: usize) -> Self {
+        let (live_tx, _) = broadcast::channel(128);
+        Self {
+            limit_bytes,
+            state: StdMutex::new(BufferedConsoleState::default()),
+            live_tx,
+        }
+    }
+
+    fn subscribe_from(&self, rendered_bytes: u64) -> BufferedConsoleSubscription {
+        let live_rx = self.live_tx.subscribe();
+        let (replay, next_offset) = self.replay_from(rendered_bytes);
+        BufferedConsoleSubscription {
+            replay,
+            next_offset,
+            live_rx,
+        }
+    }
+
+    fn replay_from(&self, rendered_bytes: u64) -> (Vec<u8>, u64) {
+        let state = self.state.lock().unwrap();
+        state.replay_from(rendered_bytes)
+    }
+
+    fn push_data(&self, payload: &[u8]) {
+        let start_offset = {
+            let mut state = self.state.lock().unwrap();
+            state.push(payload, self.limit_bytes)
+        };
+        let _ = self.live_tx.send(ConsoleOutputEvent::Data {
+            start_offset,
+            payload: payload.to_vec(),
+        });
+    }
+
+    fn push_exit(&self, code: u32) {
+        let _ = self.live_tx.send(ConsoleOutputEvent::Exit(code));
+    }
+}
+
+#[derive(Debug, Default)]
+struct BufferedConsoleState {
+    retained_start: u64,
+    next_offset: u64,
+    buffer: VecDeque<u8>,
+}
+
+impl BufferedConsoleState {
+    fn push(&mut self, payload: &[u8], limit_bytes: usize) -> u64 {
+        let start_offset = self.next_offset;
+        self.next_offset = self.next_offset.saturating_add(payload.len() as u64);
+
+        if limit_bytes == 0 {
+            self.buffer.clear();
+            self.retained_start = self.next_offset;
+            return start_offset;
+        }
+
+        if payload.len() >= limit_bytes {
+            self.buffer.clear();
+            self.buffer
+                .extend(payload[payload.len() - limit_bytes..].iter().copied());
+            self.retained_start = self.next_offset - self.buffer.len() as u64;
+            return start_offset;
+        }
+
+        self.buffer.extend(payload.iter().copied());
+        let overflow = self.buffer.len().saturating_sub(limit_bytes);
+        if overflow > 0 {
+            self.buffer.drain(..overflow);
+            self.retained_start = self.retained_start.saturating_add(overflow as u64);
+        }
+
+        start_offset
+    }
+
+    fn replay_from(&self, rendered_bytes: u64) -> (Vec<u8>, u64) {
+        let replay_from = rendered_bytes.clamp(self.retained_start, self.next_offset);
+        let skip = (replay_from - self.retained_start) as usize;
+        (
+            self.buffer.iter().skip(skip).copied().collect(),
+            self.next_offset,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
-struct ExecSessionCleanup {
-    owner: std::sync::Weak<ExecSessionManager>,
-    session_id: String,
+enum ConsoleOutputEvent {
+    Data { start_offset: u64, payload: Vec<u8> },
+    Exit(u32),
+}
+
+#[derive(Debug)]
+struct BufferedConsoleSubscription {
+    replay: Vec<u8>,
+    next_offset: u64,
+    live_rx: broadcast::Receiver<ConsoleOutputEvent>,
+}
+
+#[derive(Debug)]
+struct PersistentConsoleRuntime {
+    input_tx: mpsc::Sender<ConsoleInput>,
+    output: Arc<BufferedConsoleOutput>,
+    exit_code: Arc<StdMutex<Option<u32>>>,
 }
 
 #[derive(Debug)]
 pub struct SharedConsoleAttachment {
     input_tx: mpsc::Sender<ConsoleInput>,
-    output_rx: broadcast::Receiver<ConsoleFrame>,
+    output: Arc<BufferedConsoleOutput>,
+    output_subscription: BufferedConsoleSubscription,
     exit_code: Arc<StdMutex<Option<u32>>>,
 }
 
@@ -322,7 +441,8 @@ pub struct SharedConsoleAttachment {
 pub struct ExecSessionAttachment {
     session: Arc<ExecSession>,
     input_tx: mpsc::Sender<ConsoleInput>,
-    output_rx: broadcast::Receiver<ConsoleFrame>,
+    output: Arc<BufferedConsoleOutput>,
+    output_subscription: BufferedConsoleSubscription,
     exit_code: Arc<StdMutex<Option<u32>>>,
     takeover: CancellationToken,
     generation: u64,
@@ -346,7 +466,16 @@ pub async fn handle_console_stream(
 
     match startup.ty {
         CONSOLE_SHELL => {
-            handle_shared_console_stream(send, recv, shared_console, root_dir, inner_pid).await
+            let request = SharedConsoleRequest::from_bytes(&startup.payload)?;
+            handle_shared_console_stream(
+                send,
+                recv,
+                shared_console,
+                root_dir,
+                inner_pid,
+                request.rendered_bytes,
+            )
+            .await
         }
         CONSOLE_EXEC => {
             let request = ExecSessionRequest::from_bytes(&startup.payload)?;
@@ -375,43 +504,27 @@ async fn handle_shared_console_stream(
     shared_console: Arc<SharedConsoleManager>,
     root_dir: &Path,
     inner_pid: Pid,
+    rendered_bytes: u64,
 ) -> Result<()> {
     let SharedConsoleAttachment {
         input_tx,
-        mut output_rx,
+        output,
+        output_subscription,
         exit_code,
-    } = shared_console.attach(root_dir, inner_pid).await?;
+    } = shared_console
+        .attach(root_dir, inner_pid, rendered_bytes)
+        .await?;
 
     let session_to_client = async {
-        loop {
-            match output_rx.recv().await {
-                Ok(frame) => {
-                    let is_exit = frame.ty == CONSOLE_EXIT;
-                    frame.write_to(&mut send).await?;
-                    if is_exit {
-                        send.finish().context("finish shared console stream")?;
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if let Some(code) = read_exit_code(exit_code.as_ref()) {
-                        write_exit_frame(&mut send, code).await?;
-                        send.finish()
-                            .context("finish lagged shared console stream")?;
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    if let Some(code) = read_exit_code(exit_code.as_ref()) {
-                        write_exit_frame(&mut send, code).await?;
-                        send.finish()
-                            .context("finish closed shared console stream")?;
-                    }
-                    break;
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
+        stream_console_output(
+            &mut send,
+            output.as_ref(),
+            output_subscription,
+            exit_code.as_ref(),
+            None,
+            "finish shared console stream",
+        )
+        .await
     };
 
     let client_to_session = async { relay_client_input(&mut recv, &input_tx, None).await };
@@ -435,7 +548,8 @@ async fn handle_exec_session_stream(
     let ExecSessionAttachment {
         session,
         input_tx,
-        mut output_rx,
+        output,
+        output_subscription,
         exit_code,
         takeover,
         generation,
@@ -444,44 +558,15 @@ async fn handle_exec_session_stream(
         .await?;
 
     let session_to_client = async {
-        if let Some(code) = read_exit_code(exit_code.as_ref()) {
-            write_exit_frame(&mut send, code).await?;
-            send.finish().context("finish exited exec session stream")?;
-            return Ok::<(), anyhow::Error>(());
-        }
-
-        loop {
-            tokio::select! {
-                _ = takeover.cancelled() => break,
-                result = output_rx.recv() => {
-                    match result {
-                        Ok(frame) => {
-                            let is_exit = frame.ty == CONSOLE_EXIT;
-                            frame.write_to(&mut send).await?;
-                            if is_exit {
-                                send.finish().context("finish exec session stream")?;
-                                break;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if let Some(code) = read_exit_code(exit_code.as_ref()) {
-                                write_exit_frame(&mut send, code).await?;
-                                send.finish().context("finish lagged exec session stream")?;
-                                break;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            if let Some(code) = read_exit_code(exit_code.as_ref()) {
-                                write_exit_frame(&mut send, code).await?;
-                                send.finish().context("finish closed exec session stream")?;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
+        stream_console_output(
+            &mut send,
+            output.as_ref(),
+            output_subscription,
+            exit_code.as_ref(),
+            Some(&takeover),
+            "finish exec session stream",
+        )
+        .await
     };
 
     let client_to_session =
@@ -502,7 +587,6 @@ fn spawn_persistent_console(
     root_dir: &Path,
     inner_pid: Pid,
     wait_label: &'static str,
-    cleanup: Option<ExecSessionCleanup>,
 ) -> Result<PersistentConsoleRuntime> {
     let (master_fd, slave_fd) = open_pty().context("allocate pty pair")?;
 
@@ -518,7 +602,9 @@ fn spawn_persistent_console(
     let master = Arc::new(AsyncFd::new(master_fd).context("wrap pty master in AsyncFd")?);
 
     let (input_tx, input_rx) = mpsc::channel(64);
-    let (output_tx, _) = broadcast::channel(128);
+    let output = Arc::new(BufferedConsoleOutput::new(
+        DETACHED_OUTPUT_BUFFER_LIMIT_BYTES,
+    ));
     let exit_code = Arc::new(StdMutex::new(None));
     let shutdown = CancellationToken::new();
 
@@ -530,22 +616,21 @@ fn spawn_persistent_console(
     ));
     tokio::spawn(run_persistent_console_output(
         master,
-        output_tx.clone(),
+        Arc::clone(&output),
         shutdown.clone(),
         Arc::clone(&exit_code),
     ));
     tokio::spawn(wait_for_persistent_console_exit(
         child,
-        output_tx.clone(),
+        Arc::clone(&output),
         shutdown,
         Arc::clone(&exit_code),
         wait_label,
-        cleanup,
     ));
 
     Ok(PersistentConsoleRuntime {
         input_tx,
-        output_tx,
+        output,
         exit_code,
     })
 }
@@ -586,7 +671,7 @@ async fn run_persistent_console_input(
 
 async fn run_persistent_console_output(
     master: Arc<AsyncFd<OwnedFd>>,
-    output_tx: broadcast::Sender<ConsoleFrame>,
+    output: Arc<BufferedConsoleOutput>,
     shutdown: CancellationToken,
     exit_code: Arc<StdMutex<Option<u32>>>,
 ) {
@@ -598,7 +683,7 @@ async fn run_persistent_console_output(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        let _ = output_tx.send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()));
+                        output.push_data(&buf[..n]);
                     }
                     Err(err) => {
                         if read_exit_code(exit_code.as_ref()).is_none() {
@@ -614,11 +699,10 @@ async fn run_persistent_console_output(
 
 async fn wait_for_persistent_console_exit(
     mut child: tokio::process::Child,
-    output_tx: broadcast::Sender<ConsoleFrame>,
+    output: Arc<BufferedConsoleOutput>,
     shutdown: CancellationToken,
     exit_code: Arc<StdMutex<Option<u32>>>,
     wait_label: &'static str,
-    cleanup: Option<ExecSessionCleanup>,
 ) {
     let code = match child.wait().await {
         Ok(status) => status.code().unwrap_or(255) as u32,
@@ -633,20 +717,8 @@ async fn wait_for_persistent_console_exit(
         *guard = Some(code);
     }
 
-    let _ = output_tx.send(ConsoleFrame::new(CONSOLE_EXIT, code.to_be_bytes().to_vec()));
+    output.push_exit(code);
     shutdown.cancel();
-
-    if let Some(cleanup) = cleanup {
-        if let Some(owner) = cleanup.owner.upgrade() {
-            let session = {
-                let guard = owner.sessions.lock().await;
-                guard.get(&cleanup.session_id).cloned()
-            };
-            if let Some(session) = session {
-                owner.remove_if_same(&cleanup.session_id, &session).await;
-            }
-        }
-    }
 }
 
 async fn relay_client_input(
@@ -677,6 +749,86 @@ async fn relay_client_input(
     }
 
     Ok(())
+}
+
+async fn stream_console_output(
+    send: &mut quinn::SendStream,
+    output: &BufferedConsoleOutput,
+    mut subscription: BufferedConsoleSubscription,
+    exit_code: &StdMutex<Option<u32>>,
+    takeover: Option<&CancellationToken>,
+    finish_context: &'static str,
+) -> Result<()> {
+    send_console_bytes(send, &subscription.replay).await?;
+    let mut next_offset = subscription.next_offset;
+
+    if let Some(code) = read_exit_code(exit_code) {
+        write_exit_frame(send, code).await?;
+        send.finish().context(finish_context)?;
+        return Ok(());
+    }
+
+    loop {
+        let event = if let Some(takeover) = takeover {
+            tokio::select! {
+                _ = takeover.cancelled() => break,
+                result = subscription.live_rx.recv() => result,
+            }
+        } else {
+            subscription.live_rx.recv().await
+        };
+
+        match event {
+            Ok(ConsoleOutputEvent::Data {
+                start_offset,
+                payload,
+            }) => {
+                let end_offset = start_offset.saturating_add(payload.len() as u64);
+                if end_offset <= next_offset {
+                    continue;
+                }
+                let skip = next_offset.saturating_sub(start_offset) as usize;
+                send_console_bytes(send, &payload[skip..]).await?;
+                next_offset = end_offset;
+            }
+            Ok(ConsoleOutputEvent::Exit(code)) => {
+                write_exit_frame(send, code).await?;
+                send.finish().context(finish_context)?;
+                break;
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                let (replay, replay_end) = output.replay_from(next_offset);
+                send_console_bytes(send, &replay).await?;
+                next_offset = replay_end;
+                if let Some(code) = read_exit_code(exit_code) {
+                    write_exit_frame(send, code).await?;
+                    send.finish().context(finish_context)?;
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                let (replay, _) = output.replay_from(next_offset);
+                send_console_bytes(send, &replay).await?;
+                if let Some(code) = read_exit_code(exit_code) {
+                    write_exit_frame(send, code).await?;
+                    send.finish().context(finish_context)?;
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_console_bytes(send: &mut quinn::SendStream, payload: &[u8]) -> Result<()> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    ConsoleFrame::new(CONSOLE_DATA, payload.to_vec())
+        .write_to(send)
+        .await
 }
 
 async fn forward_client_frame(
@@ -957,14 +1109,15 @@ mod tests {
             context: Some("test context".to_string()),
             runtime: PersistentConsoleRuntime {
                 input_tx: mpsc::channel(1).0,
-                output_tx: broadcast::channel(1).0,
+                output: Arc::new(BufferedConsoleOutput::new(1024)),
                 exit_code: Arc::new(StdMutex::new(None)),
             },
             attachment: Mutex::new(ExecAttachmentState::default()),
+            owner: std::sync::Weak::new(),
         });
 
-        let first = session.attach().await?;
-        let second = session.attach().await?;
+        let first = session.attach(0).await?;
+        let second = session.attach(0).await?;
 
         assert!(first.takeover.is_cancelled());
         assert!(!second.takeover.is_cancelled());

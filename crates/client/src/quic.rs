@@ -34,7 +34,7 @@ pub async fn connect_and_run(
         let conn = connect_ready(&cfg, reprovision).await?;
         let console_conn = conn.clone();
         tokio::spawn(async move {
-            let _ = console::run_console(console_conn).await;
+            let _ = console::run_console(console_conn, 0).await;
         });
 
         forward::run_local_forwarders(conn, forwards).await?;
@@ -74,6 +74,7 @@ pub async fn list_exec_sessions(cfg: VaultConfig) -> Result<Vec<ExecSessionInfo>
 async fn run_console_with_reconnect(cfg: &VaultConfig, reprovision: bool) -> Result<()> {
     let mut reprovision = reprovision;
     let mut connected_once = false;
+    let mut rendered_bytes = 0;
 
     loop {
         let conn = match connect_ready(cfg, reprovision).await {
@@ -88,7 +89,9 @@ async fn run_console_with_reconnect(cfg: &VaultConfig, reprovision: bool) -> Res
         connected_once = true;
         reprovision = false;
 
-        match console::run_console(conn).await? {
+        let progress = console::run_console(conn, rendered_bytes).await?;
+        rendered_bytes = progress.rendered_bytes;
+        match progress.outcome {
             console::ConsoleSessionOutcome::Exited(_) => return Ok(()),
             console::ConsoleSessionOutcome::Disconnected => {
                 warn!("console connection lost; reconnecting");
@@ -103,6 +106,7 @@ async fn run_exec_with_reconnect(
     request: protocol::ExecSessionRequest,
 ) -> Result<u32> {
     let mut connected_once = false;
+    let mut request = request;
 
     loop {
         let conn = match connect_ready(cfg, false).await {
@@ -119,7 +123,9 @@ async fn run_exec_with_reconnect(
             Err(err) => return Err(err),
         };
         connected_once = true;
-        match console::run_exec(conn, request.clone()).await? {
+        let progress = console::run_exec(conn, request.clone()).await?;
+        request.rendered_bytes = progress.rendered_bytes;
+        match progress.outcome {
             console::ConsoleSessionOutcome::Exited(exit_code) => return Ok(exit_code),
             console::ConsoleSessionOutcome::Disconnected => {
                 warn!(

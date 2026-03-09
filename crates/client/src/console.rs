@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use protocol::{
-    decode_exit, encode_resize, ConsoleFrame, ExecSessionRequest, CONSOLE_DATA, CONSOLE_EXEC,
-    CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL, STREAM_CONSOLE,
+    decode_exit, encode_resize, ConsoleFrame, ExecSessionRequest, SharedConsoleRequest,
+    CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL, STREAM_CONSOLE,
 };
 use std::io::{IsTerminal, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -14,19 +14,41 @@ pub enum ConsoleSessionOutcome {
     Disconnected,
 }
 
-pub async fn run_console(conn: quinn::Connection) -> Result<ConsoleSessionOutcome> {
-    let outcome = run_session(conn, ConsoleFrame::new(CONSOLE_SHELL, vec![])).await?;
-    if let ConsoleSessionOutcome::Exited(exit_code) = outcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsoleSessionProgress {
+    pub outcome: ConsoleSessionOutcome,
+    pub rendered_bytes: u64,
+}
+
+pub async fn run_console(
+    conn: quinn::Connection,
+    rendered_bytes: u64,
+) -> Result<ConsoleSessionProgress> {
+    let progress = run_session(
+        conn,
+        ConsoleFrame::new(
+            CONSOLE_SHELL,
+            SharedConsoleRequest { rendered_bytes }.to_bytes(),
+        ),
+        rendered_bytes,
+    )
+    .await?;
+    if let ConsoleSessionOutcome::Exited(exit_code) = progress.outcome {
         eprintln!("\r\nremote shell exited with {exit_code}");
     }
-    Ok(outcome)
+    Ok(progress)
 }
 
 pub async fn run_exec(
     conn: quinn::Connection,
     request: ExecSessionRequest,
-) -> Result<ConsoleSessionOutcome> {
-    run_session(conn, ConsoleFrame::new(CONSOLE_EXEC, request.to_bytes())).await
+) -> Result<ConsoleSessionProgress> {
+    run_session(
+        conn,
+        ConsoleFrame::new(CONSOLE_EXEC, request.to_bytes()),
+        request.rendered_bytes,
+    )
+    .await
 }
 
 pub fn build_exec_request(
@@ -38,19 +60,24 @@ pub fn build_exec_request(
         session_id,
         argv: argv.map(|argv| wrap_exec_with_term(argv, current_term_for_exec())),
         context,
+        rendered_bytes: 0,
     }
 }
 
 async fn run_session(
     conn: quinn::Connection,
     startup: ConsoleFrame,
-) -> Result<ConsoleSessionOutcome> {
+    mut rendered_bytes: u64,
+) -> Result<ConsoleSessionProgress> {
     let (mut send, mut recv) = match conn.open_bi().await {
         Ok(streams) => streams,
         Err(err) => {
             let err = anyhow::Error::new(err).context("open console stream");
             if is_reconnectable_transport(&err) {
-                return Ok(ConsoleSessionOutcome::Disconnected);
+                return Ok(ConsoleSessionProgress {
+                    outcome: ConsoleSessionOutcome::Disconnected,
+                    rendered_bytes,
+                });
             }
             return Err(err);
         }
@@ -58,13 +85,19 @@ async fn run_session(
     if let Err(err) = send.write_u8(STREAM_CONSOLE).await {
         let err = anyhow::Error::new(err).context("write console stream tag");
         if is_reconnectable_transport(&err) {
-            return Ok(ConsoleSessionOutcome::Disconnected);
+            return Ok(ConsoleSessionProgress {
+                outcome: ConsoleSessionOutcome::Disconnected,
+                rendered_bytes,
+            });
         }
         return Err(err);
     }
     if let Err(err) = startup.write_to(&mut send).await {
         if is_reconnectable_transport(&err) {
-            return Ok(ConsoleSessionOutcome::Disconnected);
+            return Ok(ConsoleSessionProgress {
+                outcome: ConsoleSessionOutcome::Disconnected,
+                rendered_bytes,
+            });
         }
         return Err(err);
     }
@@ -136,6 +169,7 @@ async fn run_session(
                         .await
                         .context("write stdout")?;
                     stdout.flush().await.context("flush stdout")?;
+                    rendered_bytes = rendered_bytes.saturating_add(frame.payload.len() as u64);
                 }
                 CONSOLE_EXIT => {
                     return Ok(ConsoleSessionOutcome::Exited(decode_exit(&frame.payload)?));
@@ -164,10 +198,10 @@ async fn run_session(
         Err(err) => return Err(err).context("join send task"),
     };
 
-    match session_result {
+    let outcome = match session_result {
         Ok(ConsoleSessionOutcome::Exited(exit_code)) => {
             send_result?;
-            Ok(ConsoleSessionOutcome::Exited(exit_code))
+            ConsoleSessionOutcome::Exited(exit_code)
         }
         Ok(ConsoleSessionOutcome::Disconnected) => {
             if let Err(err) = send_result {
@@ -175,7 +209,7 @@ async fn run_session(
                     return Err(err);
                 }
             }
-            Ok(ConsoleSessionOutcome::Disconnected)
+            ConsoleSessionOutcome::Disconnected
         }
         Err(err) => {
             if is_reconnectable_transport(&err) {
@@ -184,17 +218,22 @@ async fn run_session(
                         return Err(send_err);
                     }
                 }
-                Ok(ConsoleSessionOutcome::Disconnected)
+                ConsoleSessionOutcome::Disconnected
             } else {
                 if let Err(send_err) = send_result {
                     if !is_reconnectable_transport(&send_err) {
                         return Err(send_err);
                     }
                 }
-                Err(err)
+                return Err(err);
             }
         }
-    }
+    };
+
+    Ok(ConsoleSessionProgress {
+        outcome,
+        rendered_bytes,
+    })
 }
 
 fn current_term_for_exec() -> Option<String> {

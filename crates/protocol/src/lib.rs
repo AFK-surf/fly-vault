@@ -406,10 +406,32 @@ pub fn decode_exec_argv(mut data: &[u8]) -> Result<Vec<String>> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedConsoleRequest {
+    pub rendered_bytes: u64,
+}
+
+impl SharedConsoleRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.rendered_bytes.to_be_bytes().to_vec()
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        match data.len() {
+            0 => Ok(Self { rendered_bytes: 0 }),
+            8 => Ok(Self {
+                rendered_bytes: u64::from_be_bytes(data.try_into().unwrap()),
+            }),
+            len => Err(anyhow!("invalid shared console payload length: {len}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecSessionRequest {
     pub session_id: String,
     pub argv: Option<Vec<String>>,
     pub context: Option<String>,
+    pub rendered_bytes: u64,
 }
 
 impl ExecSessionRequest {
@@ -434,6 +456,7 @@ impl ExecSessionRequest {
             }
             None => out.put_u8(0),
         }
+        out.put_u64(self.rendered_bytes);
         out.to_vec()
     }
 
@@ -461,6 +484,7 @@ impl ExecSessionRequest {
                 session_id,
                 argv,
                 context: None,
+                rendered_bytes: 0,
             });
         }
         let has_context = data.get_u8();
@@ -475,13 +499,20 @@ impl ExecSessionRequest {
             }
             other => return Err(anyhow!("invalid exec session context flag: {other}")),
         };
-        if data.has_remaining() {
-            return Err(anyhow!("exec session payload has trailing bytes"));
-        }
+        let rendered_bytes = match data.remaining() {
+            0 => 0,
+            8 => data.get_u64(),
+            other => {
+                return Err(anyhow!(
+                    "exec session payload has invalid rendered byte length: {other}"
+                ));
+            }
+        };
         Ok(Self {
             session_id,
             argv,
             context,
+            rendered_bytes,
         })
     }
 }
@@ -702,7 +733,7 @@ mod tests {
     use super::{
         decode_exec_argv, decode_proxy_packet, encode_exec_argv, encode_proxy_machine_header,
         AttestationPayload, ExecSessionInfo, ExecSessionList, ExecSessionRequest, RootfsSource,
-        RuntimeStatus, SetupRequest, VmState, PROTOCOL_VERSION,
+        RuntimeStatus, SetupRequest, SharedConsoleRequest, VmState, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -764,10 +795,26 @@ mod tests {
             session_id: "sess-123".to_string(),
             argv: Some(vec!["ls".to_string(), "-l".to_string()]),
             context: Some("investigate deploy failure".to_string()),
+            rendered_bytes: 4096,
         };
         assert_eq!(
             ExecSessionRequest::from_bytes(&request.to_bytes()).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn shared_console_request_round_trips() {
+        let request = SharedConsoleRequest {
+            rendered_bytes: 8192,
+        };
+        assert_eq!(
+            SharedConsoleRequest::from_bytes(&request.to_bytes()).unwrap(),
+            request
+        );
+        assert_eq!(
+            SharedConsoleRequest::from_bytes(&[]).unwrap(),
+            SharedConsoleRequest { rendered_bytes: 0 }
         );
     }
 

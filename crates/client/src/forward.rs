@@ -16,6 +16,7 @@ pub async fn run_local_forwarders(conn: quinn::Connection, specs: Vec<String>) -
             .await
             .with_context(|| format!("bind local port {local_port}"))?;
         let conn = conn.clone();
+        tracing::info!(local_port, target, "forwarding port");
 
         tasks.push(tokio::spawn(async move {
             loop {

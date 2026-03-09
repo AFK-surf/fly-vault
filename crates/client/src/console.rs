@@ -4,8 +4,7 @@ use protocol::{
     CONSOLE_DATA, CONSOLE_EXEC, CONSOLE_EXIT, CONSOLE_RESIZE, CONSOLE_SHELL, STREAM_CONSOLE,
 };
 use std::io::{IsTerminal, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use tokio::io::unix::AsyncFd;
+use std::os::fd::AsRawFd;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,7 +173,7 @@ async fn run_session(
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<ConsoleFrame>(64);
 
-    let stdin_task = spawn_stdin_task(is_tty, frame_tx.clone());
+    spawn_stdin_task(frame_tx.clone());
 
     let resize_task = tokio::spawn({
         let tx = frame_tx;
@@ -233,51 +232,27 @@ async fn run_session(
     }
     .await;
 
-    stdin_task.abort();
     resize_task.abort();
+    send_task.abort();
 
-    match stdin_task.await {
-        Ok(result) => result?,
-        Err(err) if err.is_cancelled() => {}
-        Err(err) => return Err(err).context("join stdin task"),
-    }
     match resize_task.await {
         Ok(result) => result?,
         Err(err) if err.is_cancelled() => {}
         Err(err) => return Err(err).context("join resize task"),
     }
-    let send_result = match send_task.await {
-        Ok(result) => result,
-        Err(err) => return Err(err).context("join send task"),
-    };
+    let _ = send_task.await;
 
     let outcome = match session_result {
         Ok(ConsoleSessionOutcome::Exited(exit_code)) => {
-            send_result?;
             ConsoleSessionOutcome::Exited(exit_code)
         }
         Ok(ConsoleSessionOutcome::Disconnected) => {
-            if let Err(err) = send_result {
-                if !is_reconnectable_transport(&err) {
-                    return Err(err);
-                }
-            }
             ConsoleSessionOutcome::Disconnected
         }
         Err(err) => {
             if is_reconnectable_transport(&err) {
-                if let Err(send_err) = send_result {
-                    if !is_reconnectable_transport(&send_err) {
-                        return Err(send_err);
-                    }
-                }
                 ConsoleSessionOutcome::Disconnected
             } else {
-                if let Err(send_err) = send_result {
-                    if !is_reconnectable_transport(&send_err) {
-                        return Err(send_err);
-                    }
-                }
                 return Err(err);
             }
         }
@@ -334,45 +309,25 @@ fn wrap_exec_with_term(argv: Vec<String>, term: Option<String>) -> Vec<String> {
     wrapped
 }
 
-fn spawn_stdin_task(
-    is_tty: bool,
-    tx: tokio::sync::mpsc::Sender<ConsoleFrame>,
-) -> tokio::task::JoinHandle<Result<()>> {
-    if is_tty {
-        tokio::spawn(async move {
-            let stdin = open_nonblocking_stdin().context("open nonblocking stdin")?;
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = read_stdin(&stdin, &mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                let _ = tx
-                    .send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()))
-                    .await;
+fn spawn_stdin_task(tx: tokio::sync::mpsc::Sender<ConsoleFrame>) {
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin = stdin.lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stdin.read(&mut buf).context("read local stdin")?;
+            if n == 0 {
+                break;
             }
-            Ok::<(), anyhow::Error>(())
-        })
-    } else {
-        tokio::task::spawn_blocking(move || {
-            let stdin = std::io::stdin();
-            let mut stdin = stdin.lock();
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = stdin.read(&mut buf).context("read local stdin")?;
-                if n == 0 {
-                    break;
-                }
-                if tx
-                    .blocking_send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()))
-                    .is_err()
-                {
-                    break;
-                }
+            if tx
+                .blocking_send(ConsoleFrame::new(CONSOLE_DATA, buf[..n].to_vec()))
+                .is_err()
+            {
+                break;
             }
-            Ok::<(), anyhow::Error>(())
-        })
-    }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
 }
 
 /// RAII guard that restores the original terminal settings on drop.
@@ -426,62 +381,6 @@ fn terminal_size() -> Option<(u16, u16)> {
         Some((ws.ws_row, ws.ws_col))
     } else {
         None
-    }
-}
-
-fn open_nonblocking_stdin() -> Result<AsyncFd<OwnedFd>> {
-    let fd = std::io::stdin().as_raw_fd();
-    let dup = unsafe { libc::dup(fd) };
-    if dup < 0 {
-        return Err(std::io::Error::last_os_error()).context("dup stdin");
-    }
-
-    let owned = unsafe { OwnedFd::from_raw_fd(dup) };
-    set_nonblocking(&owned)?;
-    AsyncFd::new(owned).context("wrap stdin in AsyncFd")
-}
-
-fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
-    let raw = fd.as_raw_fd();
-    unsafe {
-        let flags = libc::fcntl(raw, libc::F_GETFL);
-        if flags < 0 {
-            return Err(std::io::Error::last_os_error()).context("fcntl F_GETFL");
-        }
-        if libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(std::io::Error::last_os_error()).context("fcntl F_SETFL O_NONBLOCK");
-        }
-    }
-    Ok(())
-}
-
-async fn read_stdin(stdin: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize> {
-    loop {
-        if let Some(result) = try_read_fd(stdin.get_ref().as_raw_fd(), buf)? {
-            return Ok(result);
-        }
-
-        let mut guard = stdin.readable().await.context("wait for stdin readable")?;
-        match guard.try_io(|inner| {
-            try_read_fd(inner.get_ref().as_raw_fd(), buf)?
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))
-        }) {
-            Ok(result) => return result.context("read local stdin"),
-            Err(_would_block) => continue,
-        }
-    }
-}
-
-fn try_read_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n >= 0 {
-        return Ok(Some(n as usize));
-    }
-
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EAGAIN) => Ok(None),
-        _ => Err(err),
     }
 }
 

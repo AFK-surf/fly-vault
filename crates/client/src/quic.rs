@@ -480,12 +480,12 @@ fn insecure_client_config() -> Result<ClientConfig> {
     transport.initial_mtu(1200);
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(60)
+        std::time::Duration::from_secs(30)
             .try_into()
             .context("idle timeout")?,
     ));
     transport.mtu_discovery_config(None);
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)

@@ -5,6 +5,7 @@ use crate::forward;
 use crate::proxy_udp::ProxyUdpSocket;
 use crate::{TransportConfig, VaultConfig};
 use anyhow::{anyhow, Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use protocol::{
     AttestationPayload, ControlMessage, ExecSessionInfo, ExecSessionList, RootfsSource,
     SetupRequest, VmState, CHANNEL_BINDING_LABEL, PROTOCOL_VERSION, STREAM_CONTROL,
@@ -17,6 +18,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
 use std::any::Any;
+use std::io::IsTerminal;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -144,12 +146,90 @@ fn generate_exec_session_id() -> String {
     hex::encode(bytes)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ConnectPhase {
+    ResolvingAddress,
+    Handshaking,
+    RequestingAttestation,
+    VerifyingAttestation,
+    SendingSetupRequest,
+    WaitingForReady,
+}
+
+impl ConnectPhase {
+    fn message(self) -> &'static str {
+        match self {
+            ConnectPhase::ResolvingAddress => "Resolving machine address",
+            ConnectPhase::Handshaking => "Connecting to machine",
+            ConnectPhase::RequestingAttestation => "Requesting machine attestation",
+            ConnectPhase::VerifyingAttestation => "Verifying machine attestation",
+            ConnectPhase::SendingSetupRequest => "Sending setup request",
+            ConnectPhase::WaitingForReady => "Waiting for machine to become ready",
+        }
+    }
+}
+
+struct ConnectSpinner {
+    bar: Option<ProgressBar>,
+}
+
+impl ConnectSpinner {
+    fn new(cfg: &VaultConfig) -> Self {
+        if !std::io::stderr().is_terminal() {
+            return Self { bar: None };
+        }
+
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(
+            ProgressStyle::with_template("{spinner} {msg}")
+                .expect("spinner template should be valid"),
+        );
+        bar.enable_steady_tick(std::time::Duration::from_millis(100));
+        bar.set_message(format!("Connecting to {}", cfg.app));
+
+        Self { bar: Some(bar) }
+    }
+
+    fn set_phase(&self, phase: ConnectPhase) {
+        if let Some(bar) = &self.bar {
+            bar.set_message(phase.message());
+        }
+    }
+
+    fn set_setup_message(&self, state: VmState, reprovision: bool) {
+        let message = if state == VmState::Ready && !reprovision {
+            "Authenticating with machine"
+        } else if reprovision {
+            "Loading replacement rootfs"
+        } else {
+            "Loading rootfs"
+        };
+
+        if let Some(bar) = &self.bar {
+            bar.set_message(message);
+        }
+    }
+}
+
+impl Drop for ConnectSpinner {
+    fn drop(&mut self) {
+        if let Some(bar) = &self.bar {
+            if !bar.is_finished() {
+                bar.finish_and_clear();
+            }
+        }
+    }
+}
+
 async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Connection> {
     let transport = cfg.transport();
+    let spinner = ConnectSpinner::new(cfg);
     let mut endpoint = build_client_endpoint(&transport)?;
     endpoint.set_default_client_config(insecure_client_config()?);
 
+    spinner.set_phase(ConnectPhase::ResolvingAddress);
     let remote = resolve_addr(&cfg.address)?;
+    spinner.set_phase(ConnectPhase::Handshaking);
     let connect = endpoint
         .connect(remote, "fly-vault")
         .context("connect quic")?;
@@ -158,6 +238,7 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
     let mut attestation_cache = load_attestation_cache();
 
     let aud = export_attestation_audience(&conn)?;
+    spinner.set_phase(ConnectPhase::RequestingAttestation);
     let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
     send.write_u8(STREAM_CONTROL)
         .await
@@ -172,6 +253,7 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
         ControlMessage::Attestation(payload) => payload,
         other => return Err(anyhow!("expected attestation frame, got {other:?}")),
     };
+    spinner.set_phase(ConnectPhase::VerifyingAttestation);
     validate_attestation(
         cfg,
         &transport,
@@ -186,8 +268,10 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
         .access_token
         .clone()
         .ok_or_else(|| anyhow!("access_token is required"))?;
+    spinner.set_setup_message(attestation.state, reprovision);
     let rootfs = provisioning_source(cfg, attestation.state, reprovision).await?;
 
+    spinner.set_phase(ConnectPhase::SendingSetupRequest);
     ControlMessage::SetupRequest(SetupRequest {
         access_token,
         rootfs,
@@ -196,6 +280,7 @@ async fn connect_ready(cfg: &VaultConfig, reprovision: bool) -> Result<quinn::Co
     .await
     .context("send setup request")?;
 
+    spinner.set_phase(ConnectPhase::WaitingForReady);
     match ControlMessage::read_from(&mut recv).await? {
         ControlMessage::SetupComplete => Ok(conn),
         ControlMessage::Error(message) => Err(anyhow!("server setup error: {message}")),

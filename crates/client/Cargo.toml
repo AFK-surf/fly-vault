@@ -11,6 +11,7 @@ clap.workspace = true
 dirs = "5"
 hex.workspace = true
 http.workspace = true
+indicatif.workspace = true
 jsonwebtoken.workspace = true
 protocol = { path = "../protocol" }
 quinn.workspace = true

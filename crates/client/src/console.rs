@@ -164,11 +164,7 @@ async fn run_session(
             };
             match frame.ty {
                 CONSOLE_DATA => {
-                    stdout
-                        .write_all(&frame.payload)
-                        .await
-                        .context("write stdout")?;
-                    stdout.flush().await.context("flush stdout")?;
+                    write_console_output(&mut stdout, &frame.payload).await?;
                     rendered_bytes = rendered_bytes.saturating_add(frame.payload.len() as u64);
                 }
                 CONSOLE_EXIT => {
@@ -234,6 +230,42 @@ async fn run_session(
         outcome,
         rendered_bytes,
     })
+}
+
+async fn write_console_output(stdout: &mut tokio::io::Stdout, payload: &[u8]) -> Result<()> {
+    let mut written = 0;
+    while written < payload.len() {
+        match stdout.write(&payload[written..]).await {
+            Ok(0) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                    .context("write stdout");
+            }
+            Ok(n) => {
+                written += n;
+            }
+            Err(err) if is_retryable_stdout_error(&err) => {
+                tokio::task::yield_now().await;
+            }
+            Err(err) => return Err(err).context("write stdout"),
+        }
+    }
+
+    loop {
+        match stdout.flush().await {
+            Ok(()) => return Ok(()),
+            Err(err) if is_retryable_stdout_error(&err) => {
+                tokio::task::yield_now().await;
+            }
+            Err(err) => return Err(err).context("flush stdout"),
+        }
+    }
+}
+
+fn is_retryable_stdout_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    )
 }
 
 fn current_term_for_exec() -> Option<String> {
@@ -466,7 +498,7 @@ fn is_reconnectable_write_error(err: &quinn::WriteError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_reconnectable_transport, wrap_exec_with_term};
+    use super::{is_reconnectable_transport, is_retryable_stdout_error, wrap_exec_with_term};
     use anyhow::anyhow;
 
     #[test]
@@ -512,5 +544,18 @@ mod tests {
     fn reconnectable_transport_matches_connection_reset_io_errors() {
         let err = anyhow!(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert!(is_reconnectable_transport(&err));
+    }
+
+    #[test]
+    fn retryable_stdout_error_matches_would_block_and_interrupted() {
+        assert!(is_retryable_stdout_error(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(is_retryable_stdout_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(!is_retryable_stdout_error(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
     }
 }

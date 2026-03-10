@@ -421,6 +421,7 @@ fn terminal_size() -> Option<(u16, u16)> {
 }
 
 pub fn is_reconnectable_transport(err: &anyhow::Error) -> bool {
+    tracing::warn!(error = ?err, "transport error");
     err.chain().any(|cause| {
         cause
             .downcast_ref::<quinn::ConnectionError>()

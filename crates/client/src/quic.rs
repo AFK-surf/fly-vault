@@ -121,6 +121,7 @@ impl ReconnectableConnection {
                         continue;
                     }
 
+                    tracing::error!(error = ?err, "reconnect failed; not retrying");
                     return Err(err);
                 }
             }

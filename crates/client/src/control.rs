@@ -1,4 +1,4 @@
-use crate::{console, forward, quic};
+use crate::{forward, quic};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -20,7 +20,7 @@ use tracing::{info, warn};
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, anyhow::Error>;
 
 struct ControlState {
-    conn: quinn::Connection,
+    connections: quic::ReconnectableConnection,
     forwards: Mutex<HashMap<u16, ForwardEntry>>,
 }
 
@@ -29,7 +29,10 @@ struct ForwardEntry {
     task: tokio::task::JoinHandle<()>,
 }
 
-pub async fn serve(conn: quinn::Connection, path: impl AsRef<Path>) -> Result<()> {
+pub async fn serve(
+    connections: quic::ReconnectableConnection,
+    path: impl AsRef<Path>,
+) -> Result<()> {
     let path = path.as_ref();
 
     // Remove stale socket file if present.
@@ -44,7 +47,7 @@ pub async fn serve(conn: quinn::Connection, path: impl AsRef<Path>) -> Result<()
     info!(path = %path.display(), "control socket listening");
 
     let state = Arc::new(ControlState {
-        conn,
+        connections,
         forwards: Mutex::new(HashMap::new()),
     });
 
@@ -120,11 +123,11 @@ async fn handle_exec(
     let (output_tx, output_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
 
     // Spawn the QUIC exec session that feeds output into the channel.
-    let exec_conn = state.conn.clone();
+    let connections = state.connections.clone();
     let spawn_session_id = session_id.clone();
     tokio::spawn(async move {
         let sid = spawn_session_id;
-        match console::run_exec_streaming(exec_conn, request, output_tx).await {
+        match quic::run_exec_streaming_with_reconnect(&connections, request, output_tx).await {
             Ok(exit_code) => {
                 info!(session_id = sid, exit_code, "exec session completed");
             }
@@ -149,34 +152,38 @@ async fn handle_exec(
 }
 
 async fn handle_list_exec(state: &ControlState) -> Result<Response<BoxBody>> {
-    let (mut send, mut recv) = match state.conn.open_bi().await {
-        Ok(streams) => streams,
-        Err(err) => {
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("open exec-list stream: {err}"),
-            )
+    let list = loop {
+        let lease = match state.connections.connect().await {
+            Ok(lease) => lease,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("connect to machine: {err}"),
+                )
+            }
+        };
+        let conn = lease.conn();
+        let result: Result<ExecSessionList> = async {
+            let (mut send, mut recv) = conn.open_bi().await.context("open exec-list stream")?;
+            send.write_u8(STREAM_EXEC_LIST)
+                .await
+                .context("write exec-list tag")?;
+            send.finish().context("finish exec-list request")?;
+            ExecSessionList::read_from(&mut recv)
+                .await
+                .context("read exec-list response")
         }
-    };
-    if let Err(err) = send.write_u8(STREAM_EXEC_LIST).await {
-        return json_error(
-            StatusCode::BAD_GATEWAY,
-            &format!("write exec-list tag: {err}"),
-        );
-    }
-    if let Err(err) = send.finish() {
-        return json_error(
-            StatusCode::BAD_GATEWAY,
-            &format!("finish exec-list request: {err}"),
-        );
-    }
-    let list = match ExecSessionList::read_from(&mut recv).await {
-        Ok(list) => list,
-        Err(err) => {
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("read exec-list response: {err}"),
-            )
+        .await;
+
+        match result {
+            Ok(list) => break list,
+            Err(err) if crate::console::is_reconnectable_transport(&err) => {
+                state.connections.invalidate(lease.generation()).await;
+                continue;
+            }
+            Err(err) => {
+                return json_error(StatusCode::BAD_GATEWAY, &format!("{err}"));
+            }
         }
     };
 
@@ -234,7 +241,7 @@ async fn handle_create_forward(
         }
     };
 
-    let conn = state.conn.clone();
+    let connections = state.connections.clone();
     let task_target = target.clone();
     let task = tokio::spawn(async move {
         loop {
@@ -245,10 +252,12 @@ async fn handle_create_forward(
                     break;
                 }
             };
-            let conn = conn.clone();
+            let connections = connections.clone();
             let target = task_target.clone();
             tokio::spawn(async move {
-                if let Err(err) = forward::bridge_one(conn, socket, target).await {
+                if let Err(err) =
+                    forward::bridge_one_with_reconnect(connections, socket, target).await
+                {
                     warn!(local_port, error = %err, "forward bridge error");
                 }
             });

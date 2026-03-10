@@ -23,8 +23,132 @@ use std::io::IsTerminal;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
+
+#[derive(Clone)]
+pub(crate) struct ReconnectableConnection {
+    inner: Arc<ReconnectableConnectionInner>,
+}
+
+struct ReconnectableConnectionInner {
+    cfg: VaultConfig,
+    state: Mutex<ReconnectState>,
+    notify: Notify,
+}
+
+#[derive(Clone)]
+pub(crate) struct ConnectionLease {
+    conn: quinn::Connection,
+    generation: u64,
+}
+
+struct ReconnectState {
+    current: Option<ConnectionLease>,
+    next_generation: u64,
+    connected_once: bool,
+    reconnecting: bool,
+    reprovision: bool,
+}
+
+impl ReconnectableConnection {
+    pub(crate) fn new(cfg: VaultConfig, reprovision: bool) -> Self {
+        Self {
+            inner: Arc::new(ReconnectableConnectionInner {
+                cfg,
+                state: Mutex::new(ReconnectState {
+                    current: None,
+                    next_generation: 0,
+                    connected_once: false,
+                    reconnecting: false,
+                    reprovision,
+                }),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) async fn connect(&self) -> Result<ConnectionLease> {
+        loop {
+            let connect_attempt = {
+                let mut state = self.inner.state.lock().await;
+                if let Some(lease) = state.current.clone() {
+                    return Ok(lease);
+                }
+                if state.reconnecting {
+                    None
+                } else {
+                    state.reconnecting = true;
+                    Some((state.connected_once, state.reprovision))
+                }
+            };
+
+            let Some((connected_once, reprovision)) = connect_attempt else {
+                self.inner.notify.notified().await;
+                continue;
+            };
+
+            match connect_ready(&self.inner.cfg, reprovision).await {
+                Ok(conn) => {
+                    let lease = {
+                        let mut state = self.inner.state.lock().await;
+                        let lease = ConnectionLease {
+                            conn,
+                            generation: state.next_generation,
+                        };
+                        state.next_generation += 1;
+                        state.connected_once = true;
+                        state.reprovision = false;
+                        state.reconnecting = false;
+                        state.current = Some(lease.clone());
+                        lease
+                    };
+                    self.inner.notify.notify_waiters();
+                    return Ok(lease);
+                }
+                Err(err) => {
+                    {
+                        let mut state = self.inner.state.lock().await;
+                        state.reconnecting = false;
+                    }
+                    self.inner.notify.notify_waiters();
+
+                    if connected_once && console::is_reconnectable_transport(&err) {
+                        warn!(error = ?err, "reconnect failed; retrying");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn invalidate(&self, generation: u64) {
+        let mut state = self.inner.state.lock().await;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|lease| lease.generation == generation)
+        {
+            state.current = None;
+            self.inner.notify.notify_waiters();
+        }
+    }
+}
+
+impl ConnectionLease {
+    pub(crate) fn conn(&self) -> quinn::Connection {
+        self.conn.clone()
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
 
 pub async fn connect_and_run(
     cfg: VaultConfig,
@@ -32,20 +156,22 @@ pub async fn connect_and_run(
     reprovision: bool,
     control_socket: Option<PathBuf>,
 ) -> Result<()> {
-    if forwards.is_empty() && control_socket.is_none() {
-        run_console_with_reconnect(&cfg, reprovision).await?;
-    } else {
-        let conn = connect_ready(&cfg, reprovision).await?;
+    let connections = ReconnectableConnection::new(cfg.clone(), reprovision);
 
-        let console_conn = conn.clone();
+    if forwards.is_empty() && control_socket.is_none() {
+        run_console_with_reconnect(&connections).await?;
+    } else {
+        let console_connections = connections.clone();
         tokio::spawn(async move {
-            let _ = console::run_console(console_conn, 0).await;
+            if let Err(err) = run_console_with_reconnect(&console_connections).await {
+                warn!(error = %err, "console exited");
+            }
         });
 
         if let Some(path) = control_socket {
-            let control_conn = conn.clone();
+            let control_connections = connections.clone();
             tokio::spawn(async move {
-                if let Err(err) = control::serve(control_conn, path).await {
+                if let Err(err) = control::serve(control_connections, path).await {
                     warn!(error = %err, "control socket exited");
                 }
             });
@@ -54,7 +180,7 @@ pub async fn connect_and_run(
         if forwards.is_empty() {
             tokio::signal::ctrl_c().await?;
         } else {
-            forward::run_local_forwarders(conn, forwards).await?;
+            forward::run_local_forwarders(connections, forwards).await?;
         }
     }
 
@@ -75,7 +201,8 @@ pub async fn connect_and_exec(
         if has_command { Some(command) } else { None },
         if has_command { context } else { None },
     );
-    run_exec_with_reconnect(&cfg, request).await
+    let connections = ReconnectableConnection::new(cfg, false);
+    run_exec_with_reconnect(&connections, request).await
 }
 
 pub async fn list_exec_sessions(cfg: VaultConfig) -> Result<Vec<ExecSessionInfo>> {
@@ -89,68 +216,70 @@ pub async fn list_exec_sessions(cfg: VaultConfig) -> Result<Vec<ExecSessionInfo>
     Ok(list.sessions)
 }
 
-async fn run_console_with_reconnect(cfg: &VaultConfig, reprovision: bool) -> Result<()> {
-    let mut reprovision = reprovision;
-    let mut connected_once = false;
+async fn run_console_with_reconnect(connections: &ReconnectableConnection) -> Result<()> {
     let mut rendered_bytes = 0;
 
     loop {
-        let conn = match connect_ready(cfg, reprovision).await {
-            Ok(conn) => conn,
-            Err(err) if connected_once && console::is_reconnectable_transport(&err) => {
-                warn!(error = ?err, "console reconnect failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        connected_once = true;
-        reprovision = false;
+        let lease = connections.connect().await?;
 
-        let progress = console::run_console(conn, rendered_bytes).await?;
+        let progress = console::run_console(lease.conn(), rendered_bytes).await?;
         rendered_bytes = progress.rendered_bytes;
         match progress.outcome {
             console::ConsoleSessionOutcome::Exited(_) => return Ok(()),
             console::ConsoleSessionOutcome::Disconnected => {
+                connections.invalidate(lease.generation()).await;
                 warn!("console connection lost; reconnecting");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
 }
 
 async fn run_exec_with_reconnect(
-    cfg: &VaultConfig,
+    connections: &ReconnectableConnection,
     request: protocol::ExecSessionRequest,
 ) -> Result<u32> {
-    let mut connected_once = false;
     let mut request = request;
 
     loop {
-        let conn = match connect_ready(cfg, false).await {
-            Ok(conn) => conn,
-            Err(err) if connected_once && console::is_reconnectable_transport(&err) => {
-                warn!(
-                    error = ?err,
-                    session_id = %request.session_id,
-                    "exec reconnect failed; retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        connected_once = true;
-        let progress = console::run_exec(conn, request.clone()).await?;
+        let lease = connections.connect().await?;
+        let progress = console::run_exec(lease.conn(), request.clone()).await?;
         request.rendered_bytes = progress.rendered_bytes;
         match progress.outcome {
             console::ConsoleSessionOutcome::Exited(exit_code) => return Ok(exit_code),
             console::ConsoleSessionOutcome::Disconnected => {
+                connections.invalidate(lease.generation()).await;
                 warn!(
                     session_id = %request.session_id,
                     "exec connection lost; reconnecting"
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+pub(crate) async fn run_exec_streaming_with_reconnect(
+    connections: &ReconnectableConnection,
+    request: protocol::ExecSessionRequest,
+    output_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+) -> Result<u32> {
+    let mut request = request;
+
+    loop {
+        let lease = connections.connect().await?;
+        let progress =
+            console::run_exec_streaming(lease.conn(), request.clone(), output_tx.clone()).await?;
+        request.rendered_bytes = progress.rendered_bytes;
+        match progress.outcome {
+            console::ConsoleSessionOutcome::Exited(exit_code) => return Ok(exit_code),
+            console::ConsoleSessionOutcome::Disconnected => {
+                connections.invalidate(lease.generation()).await;
+                warn!(
+                    session_id = %request.session_id,
+                    "streaming exec connection lost; reconnecting"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }

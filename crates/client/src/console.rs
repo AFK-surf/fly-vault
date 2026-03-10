@@ -57,24 +57,60 @@ pub async fn run_exec_streaming(
     conn: quinn::Connection,
     request: ExecSessionRequest,
     output_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
-) -> Result<u32> {
-    let (mut send, mut recv) = conn.open_bi().await.context("open exec stream")?;
-    send.write_u8(STREAM_CONSOLE)
-        .await
-        .context("write console stream tag")?;
-    ConsoleFrame::new(CONSOLE_EXEC, request.to_bytes())
+) -> Result<ConsoleSessionProgress> {
+    let mut rendered_bytes = request.rendered_bytes;
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(streams) => streams,
+        Err(err) => {
+            let err = anyhow::Error::new(err).context("open exec stream");
+            if is_reconnectable_transport(&err) {
+                return Ok(ConsoleSessionProgress {
+                    outcome: ConsoleSessionOutcome::Disconnected,
+                    rendered_bytes,
+                });
+            }
+            return Err(err);
+        }
+    };
+    if let Err(err) = send.write_u8(STREAM_CONSOLE).await {
+        let err = anyhow::Error::new(err).context("write console stream tag");
+        if is_reconnectable_transport(&err) {
+            return Ok(ConsoleSessionProgress {
+                outcome: ConsoleSessionOutcome::Disconnected,
+                rendered_bytes,
+            });
+        }
+        return Err(err);
+    }
+    if let Err(err) = ConsoleFrame::new(CONSOLE_EXEC, request.to_bytes())
         .write_to(&mut send)
         .await
-        .context("write exec startup frame")?;
+    {
+        if is_reconnectable_transport(&err) {
+            return Ok(ConsoleSessionProgress {
+                outcome: ConsoleSessionOutcome::Disconnected,
+                rendered_bytes,
+            });
+        }
+        return Err(err).context("write exec startup frame");
+    }
 
     // Keep `send` alive — finishing or dropping it signals EOF/RESET to the
     // remote, which would tear down the session before output arrives.
     let exit_code = loop {
-        let frame = ConsoleFrame::read_from(&mut recv)
-            .await
-            .context("read exec frame")?;
+        let frame = match ConsoleFrame::read_from(&mut recv).await {
+            Ok(frame) => frame,
+            Err(err) if is_reconnectable_transport(&err) => {
+                return Ok(ConsoleSessionProgress {
+                    outcome: ConsoleSessionOutcome::Disconnected,
+                    rendered_bytes,
+                });
+            }
+            Err(err) => return Err(err).context("read exec frame"),
+        };
         match frame.ty {
             CONSOLE_DATA => {
+                let payload_len = frame.payload.len();
                 if output_tx
                     .send(bytes::Bytes::from(frame.payload))
                     .await
@@ -83,6 +119,7 @@ pub async fn run_exec_streaming(
                     // HTTP client disconnected
                     break decode_exit(&wait_for_exit(&mut recv).await?)?;
                 }
+                rendered_bytes = rendered_bytes.saturating_add(payload_len as u64);
             }
             CONSOLE_EXIT => {
                 break decode_exit(&frame.payload)?;
@@ -92,7 +129,10 @@ pub async fn run_exec_streaming(
     };
 
     let _ = send.finish();
-    Ok(exit_code)
+    Ok(ConsoleSessionProgress {
+        outcome: ConsoleSessionOutcome::Exited(exit_code),
+        rendered_bytes,
+    })
 }
 
 /// Drain frames until a CONSOLE_EXIT arrives, returning its payload.
@@ -243,12 +283,8 @@ async fn run_session(
     let _ = send_task.await;
 
     let outcome = match session_result {
-        Ok(ConsoleSessionOutcome::Exited(exit_code)) => {
-            ConsoleSessionOutcome::Exited(exit_code)
-        }
-        Ok(ConsoleSessionOutcome::Disconnected) => {
-            ConsoleSessionOutcome::Disconnected
-        }
+        Ok(ConsoleSessionOutcome::Exited(exit_code)) => ConsoleSessionOutcome::Exited(exit_code),
+        Ok(ConsoleSessionOutcome::Disconnected) => ConsoleSessionOutcome::Disconnected,
         Err(err) => {
             if is_reconnectable_transport(&err) {
                 ConsoleSessionOutcome::Disconnected

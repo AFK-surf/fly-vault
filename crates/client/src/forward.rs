@@ -1,9 +1,13 @@
+use crate::{console, quic};
 use anyhow::{anyhow, Context, Result};
 use protocol::STREAM_PORT_FORWARD;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-pub async fn run_local_forwarders(conn: quinn::Connection, specs: Vec<String>) -> Result<()> {
+pub async fn run_local_forwarders(
+    connections: quic::ReconnectableConnection,
+    specs: Vec<String>,
+) -> Result<()> {
     if specs.is_empty() {
         tokio::signal::ctrl_c().await.context("wait for ctrl-c")?;
         return Ok(());
@@ -15,17 +19,17 @@ pub async fn run_local_forwarders(conn: quinn::Connection, specs: Vec<String>) -
         let listener = TcpListener::bind(("127.0.0.1", local_port))
             .await
             .with_context(|| format!("bind local port {local_port}"))?;
-        let conn = conn.clone();
+        let connections = connections.clone();
         tracing::info!(local_port, target, "forwarding port");
 
         tasks.push(tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await?;
-                let conn = conn.clone();
+                let connections = connections.clone();
                 let target = target.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = bridge_one(conn, socket, target).await {
-                        eprintln!("forward error: {err:#}");
+                    if let Err(err) = bridge_one_with_reconnect(connections, socket, target).await {
+                        tracing::warn!(error = %err, "forward error");
                     }
                 });
             }
@@ -40,6 +44,21 @@ pub async fn run_local_forwarders(conn: quinn::Connection, specs: Vec<String>) -
     }
 
     Ok(())
+}
+
+pub(crate) async fn bridge_one_with_reconnect(
+    connections: quic::ReconnectableConnection,
+    local: TcpStream,
+    target: String,
+) -> Result<()> {
+    let lease = connections.connect().await?;
+    let result = bridge_one(lease.conn(), local, target).await;
+    if let Err(err) = &result {
+        if console::is_reconnectable_transport(err) {
+            connections.invalidate(lease.generation()).await;
+        }
+    }
+    result
 }
 
 pub(crate) async fn bridge_one(

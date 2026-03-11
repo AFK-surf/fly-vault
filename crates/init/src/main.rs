@@ -1,4 +1,5 @@
 mod attest;
+mod firewall;
 mod forward;
 mod quic;
 mod setup;
@@ -56,6 +57,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if !args.test_mode {
+        let listen_port = args
+            .listen
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .context("parse listen port from address")?;
+        firewall::setup(listen_port).context("set up nftables firewall")?;
+    }
 
     let mut setup = setup::SetupManager::new(
         args.data_dir.clone(),

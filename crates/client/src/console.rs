@@ -432,17 +432,7 @@ pub fn is_reconnectable_transport(err: &anyhow::Error) -> bool {
             || cause
                 .downcast_ref::<quinn::WriteError>()
                 .is_some_and(is_reconnectable_write_error)
-            || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                matches!(
-                    io.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::NotConnected
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::UnexpectedEof
-                )
-            })
+            || cause.downcast_ref::<std::io::Error>().is_some()
     })
 }
 

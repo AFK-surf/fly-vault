@@ -10,7 +10,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
 
@@ -92,3 +92,59 @@ jobs:
         run: |
           cosign attest --yes --predicate sbom.spdx.json --type spdxjson \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+
+  build-client:
+    name: Build Client (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact: fly-vault-x86_64-linux
+          - target: aarch64-unknown-linux-musl
+            artifact: fly-vault-aarch64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild and ziglang
+        run: pip install ziglang && cargo install cargo-zigbuild
+
+      - name: Build fly-vault
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p fly-vault
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/fly-vault ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-client
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: artifacts/*

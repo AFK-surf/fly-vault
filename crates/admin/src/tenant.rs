@@ -7,8 +7,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::machines::{
-    checks_are_passing, config_image, mounted_volume_ids, with_metadata, CreateMachineRequest,
-    CreateVolumeRequest, ImageRef, Machine, MachinesClient,
+    checks_are_passing, classify_machine_action_error, config_image, mounted_volume_ids,
+    with_metadata, CreateMachineRequest, CreateVolumeRequest, ImageRef, Machine, MachineAction,
+    MachineActionDisposition, MachineUsageFact, MachinesClient, DEFAULT_VOLUME_SIZE_GIB,
 };
 use crate::template::{load_template, render_template};
 
@@ -155,7 +156,16 @@ async fn cleanup_created_machines(client: &MachinesClient, machine_ids: &[String
     let mut errors = Vec::new();
     for machine_id in machine_ids {
         if let Err(err) = client.delete_machine(machine_id, true).await {
-            errors.push(format!("delete machine {}: {}", machine_id, err));
+            match classify_machine_action_error(MachineAction::DeleteMachine, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => errors.push(format!(
+                    "delete machine {} (retryable): {}",
+                    machine_id, err
+                )),
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete machine {}: {}", machine_id, err))
+                }
+            }
         }
     }
     errors
@@ -165,7 +175,15 @@ async fn cleanup_created_volumes(client: &MachinesClient, volume_ids: &[String])
     let mut errors = Vec::new();
     for volume_id in volume_ids {
         if let Err(err) = client.delete_volume(volume_id).await {
-            errors.push(format!("delete volume {}: {}", volume_id, err));
+            match classify_machine_action_error(MachineAction::DeleteVolume, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => {
+                    errors.push(format!("delete volume {} (retryable): {}", volume_id, err))
+                }
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete volume {}: {}", volume_id, err))
+                }
+            }
         }
     }
     errors
@@ -255,7 +273,7 @@ async fn ensure_mount_volumes(
             .and_then(|mount_obj| mount_obj.get("size_gb"))
             .and_then(Value::as_u64)
             .map(|value| value as u32)
-            .or(Some(30));
+            .or(Some(DEFAULT_VOLUME_SIZE_GIB));
 
         let volume = match client
             .create_volume(&CreateVolumeRequest {
@@ -354,7 +372,15 @@ pub async fn delete_tenant(
 
         if machine.state == "started" {
             if let Err(err) = client.stop_machine(&machine.id).await {
-                errors.push(format!("stop {}: {}", machine.id, err));
+                match classify_machine_action_error(MachineAction::Stop, &err) {
+                    MachineActionDisposition::AlreadyApplied => {}
+                    MachineActionDisposition::Retryable => {
+                        errors.push(format!("stop {} (retryable): {}", machine.id, err))
+                    }
+                    MachineActionDisposition::Fatal => {
+                        errors.push(format!("stop {}: {}", machine.id, err))
+                    }
+                }
             } else if let Err(err) = client
                 .wait_for_state(
                     &machine.id,
@@ -369,13 +395,30 @@ pub async fn delete_tenant(
         }
 
         if let Err(err) = client.delete_machine(&machine.id, true).await {
-            errors.push(format!("delete machine {}: {}", machine.id, err));
+            match classify_machine_action_error(MachineAction::DeleteMachine, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => errors.push(format!(
+                    "delete machine {} (retryable): {}",
+                    machine.id, err
+                )),
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete machine {}: {}", machine.id, err))
+                }
+            }
         }
     }
 
     for volume_id in &volume_ids {
         if let Err(err) = client.delete_volume(volume_id).await {
-            errors.push(format!("delete volume {}: {}", volume_id, err));
+            match classify_machine_action_error(MachineAction::DeleteVolume, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => {
+                    errors.push(format!("delete volume {} (retryable): {}", volume_id, err))
+                }
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete volume {}: {}", volume_id, err))
+                }
+            }
         }
     }
 
@@ -466,6 +509,7 @@ struct TenantMachine {
     #[serde(skip_serializing_if = "Option::is_none")]
     image_ref: Option<ImageRef>,
     volumes: Vec<String>,
+    usage_fact: MachineUsageFact,
     config: Value,
     #[serde(skip_serializing_if = "Value::is_null")]
     checks: Value,
@@ -506,6 +550,7 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
     let mut machine_rows = Vec::with_capacity(total);
 
     for machine in machines {
+        let usage_fact = machine.usage_fact();
         if let Some(region) = machine.region.clone() {
             regions.insert(region);
         }
@@ -530,7 +575,11 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
             images.insert(image.clone());
         }
 
-        let volumes = mounted_volume_ids(&machine);
+        let volumes = usage_fact
+            .volumes
+            .iter()
+            .map(|volume| volume.volume_id.clone())
+            .collect();
         machine_rows.push(TenantMachine {
             id: machine.id,
             name: machine.name,
@@ -543,6 +592,7 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
             image,
             image_ref: machine.image_ref,
             volumes,
+            usage_fact,
             config: machine.config,
             checks: machine.checks,
         });
@@ -645,6 +695,54 @@ fn truncate(value: &str, width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_tenant;
+    use crate::machines::{Machine, DEFAULT_VOLUME_SIZE_GIB};
+    use serde_json::json;
+
+    #[test]
+    fn tenant_summary_machine_json_includes_usage_fact() {
+        let summary = summarize_tenant(
+            "tenant-1".to_string(),
+            vec![Machine {
+                id: "machine-1".to_string(),
+                name: Some("worker".to_string()),
+                state: "started".to_string(),
+                region: Some("sjc".to_string()),
+                instance_id: Some("instance-1".to_string()),
+                private_ip: Some("fdaa::1".to_string()),
+                created_at: Some("2026-04-08T00:00:00Z".to_string()),
+                updated_at: Some("2026-04-08T01:00:00Z".to_string()),
+                image_ref: None,
+                config: json!({
+                    "metadata": {
+                        "fly_vault.tenant_id": "tenant-1",
+                        "fly_vault.managed_by": "fly-vault-admin"
+                    },
+                    "mounts": [
+                        { "volume": "vol-1", "name": "data", "path": "/data", "size_gb": 80 },
+                        { "volume": "vol-2", "name": "cache", "path": "/cache" }
+                    ]
+                }),
+                checks: json!({}),
+            }],
+        );
+
+        assert_eq!(summary.machines.len(), 1);
+        let machine = &summary.machines[0];
+        assert_eq!(machine.volumes, vec!["vol-1".to_string(), "vol-2".to_string()]);
+        assert_eq!(machine.usage_fact.machine_id, "machine-1");
+        assert_eq!(machine.usage_fact.state, "started");
+        assert_eq!(machine.usage_fact.region.as_deref(), Some("sjc"));
+        assert_eq!(machine.usage_fact.volumes.len(), 2);
+        assert_eq!(machine.usage_fact.volumes[0].volume_id, "vol-1");
+        assert_eq!(machine.usage_fact.volumes[0].size_gib, 80);
+        assert_eq!(machine.usage_fact.volumes[1].volume_id, "vol-2");
+        assert_eq!(machine.usage_fact.volumes[1].size_gib, DEFAULT_VOLUME_SIZE_GIB);
+    }
 }
 
 pub async fn wait_for_health(

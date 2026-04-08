@@ -140,6 +140,16 @@ Commands:
 fly-vault-admin tenant create acme --template ./tenant.template.toml --access-token secret
 fly-vault-admin tenant create acme --template ./tenant.template.toml --dry-run
 fly-vault-admin tenant list --wide
+fly-vault-admin tenant list --json
 fly-vault-admin tenant delete acme --yes
 fly-vault-admin tenant update-image --image registry.fly.io/vault-tenants/init:latest --all-tenants
 ```
+
+`tenant list --json` now includes a per-machine `usage_fact` object with:
+
+- `machine_id`, `state`, `region`, `instance_id`
+- `metadata`
+- `volumes[].volume_id`
+- `volumes[].size_gib`
+
+This JSON shape is intended to be consumed by upstream metering adapters such as `unbox`.

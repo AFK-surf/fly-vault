@@ -866,6 +866,79 @@ fn truncate(value: &str, width: usize) -> String {
     out
 }
 
+pub async fn wait_for_health(
+    client: &MachinesClient,
+    machine_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let machine = client
+            .get_machine(machine_id)
+            .await
+            .with_context(|| format!("fetch machine {}", machine_id))?;
+
+        if machine.state != "started" {
+            return Err(anyhow!(
+                "machine {} left started state during health check: {}",
+                machine_id,
+                machine.state
+            ));
+        }
+
+        match checks_are_passing(&machine.checks) {
+            None | Some(true) => return Ok(()),
+            Some(false) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "machine {} checks failed to pass before timeout",
+                        machine_id
+                    ));
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+pub async fn verify_soak_window(
+    client: &MachinesClient,
+    machine_id: &str,
+    soak: Duration,
+) -> Result<()> {
+    if soak.is_zero() {
+        return Ok(());
+    }
+
+    let deadline = tokio::time::Instant::now() + soak;
+    while tokio::time::Instant::now() < deadline {
+        let machine = client
+            .get_machine(machine_id)
+            .await
+            .with_context(|| format!("fetch machine {} during soak", machine_id))?;
+
+        if machine.state != "started" {
+            return Err(anyhow!(
+                "machine {} crashed during soak window (state={})",
+                machine_id,
+                machine.state
+            ));
+        }
+
+        if matches!(checks_are_passing(&machine.checks), Some(false)) {
+            return Err(anyhow!(
+                "machine {} failed checks during soak window",
+                machine_id
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{summarize_tenant, usage_facts_from_machines};
@@ -980,77 +1053,4 @@ mod tests {
         assert_eq!(facts[1].started_at, None);
         assert_eq!(facts[1].deleted_at.as_deref(), Some("2026-04-08T02:00:00Z"));
     }
-}
-
-pub async fn wait_for_health(
-    client: &MachinesClient,
-    machine_id: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let machine = client
-            .get_machine(machine_id)
-            .await
-            .with_context(|| format!("fetch machine {}", machine_id))?;
-
-        if machine.state != "started" {
-            return Err(anyhow!(
-                "machine {} left started state during health check: {}",
-                machine_id,
-                machine.state
-            ));
-        }
-
-        match checks_are_passing(&machine.checks) {
-            None | Some(true) => return Ok(()),
-            Some(false) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow!(
-                        "machine {} checks failed to pass before timeout",
-                        machine_id
-                    ));
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        }
-    }
-}
-
-pub async fn verify_soak_window(
-    client: &MachinesClient,
-    machine_id: &str,
-    soak: Duration,
-) -> Result<()> {
-    if soak.is_zero() {
-        return Ok(());
-    }
-
-    let deadline = tokio::time::Instant::now() + soak;
-    while tokio::time::Instant::now() < deadline {
-        let machine = client
-            .get_machine(machine_id)
-            .await
-            .with_context(|| format!("fetch machine {} during soak", machine_id))?;
-
-        if machine.state != "started" {
-            return Err(anyhow!(
-                "machine {} crashed during soak window (state={})",
-                machine_id,
-                machine.state
-            ));
-        }
-
-        if matches!(checks_are_passing(&machine.checks), Some(false)) {
-            return Err(anyhow!(
-                "machine {} failed checks during soak window",
-                machine_id
-            ));
-        }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    Ok(())
 }

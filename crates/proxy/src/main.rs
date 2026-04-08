@@ -94,17 +94,17 @@ async fn main() -> anyhow::Result<()> {
             full_machine_map.clone(),
             refresh_interval,
         ) => {}
-        _ = proxy::run_proxy(
+        _ = proxy::run_proxy(proxy::ProxyRuntime {
             frontend,
             machine_map,
             full_machine_map,
-            sessions.clone(),
-            args.backend_port,
+            sessions: sessions.clone(),
+            backend_port: args.backend_port,
             http_client,
-            fly_api_token,
-            fly_app,
+            api_token: fly_api_token,
+            app: fly_app,
             starting,
-        ) => {}
+        }) => {}
         _ = session::cleanup_sessions(sessions, session_timeout) => {}
     }
 

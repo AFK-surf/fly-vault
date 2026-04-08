@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use machines::MachinesClient;
 use rollout::{update_image, UpdateImageOptions};
-use tenant::{create_tenant, delete_tenant, list_tenants};
+use tenant::{create_tenant, delete_tenant, list_tenants, print_usage_facts, serve_usage_facts};
 
 #[derive(Debug, Parser)]
 #[command(name = "fly-vault-admin")]
@@ -70,6 +70,14 @@ enum TenantCommand {
         wide: bool,
         #[arg(long)]
         json: bool,
+    },
+    UsageFacts {
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long)]
+        bearer_token: Option<String>,
     },
     UpdateImage {
         #[arg(long)]
@@ -156,6 +164,18 @@ async fn main() -> Result<()> {
             }
             TenantCommand::List { tenant, wide, json } => {
                 list_tenants(&client, tenant.as_deref(), wide, json).await?;
+            }
+            TenantCommand::UsageFacts {
+                tenant,
+                listen,
+                bearer_token,
+            } => {
+                if let Some(listen) = listen {
+                    serve_usage_facts(&client, tenant.as_deref(), &listen, bearer_token.as_deref())
+                        .await?;
+                } else {
+                    print_usage_facts(&client, tenant.as_deref()).await?;
+                }
             }
             TenantCommand::UpdateImage {
                 image,

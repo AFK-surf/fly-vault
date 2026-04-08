@@ -140,6 +140,24 @@ Commands:
 fly-vault-admin tenant create acme --template ./tenant.template.toml --access-token secret
 fly-vault-admin tenant create acme --template ./tenant.template.toml --dry-run
 fly-vault-admin tenant list --wide
+fly-vault-admin tenant list --json
+fly-vault-admin tenant usage-facts --tenant acme
+fly-vault-admin tenant usage-facts --listen 127.0.0.1:18083 --bearer-token secret
 fly-vault-admin tenant delete acme --yes
 fly-vault-admin tenant update-image --image registry.fly.io/vault-tenants/init:latest --all-tenants
 ```
+
+`tenant usage-facts` emits a flat array of machine usage facts, and
+`tenant usage-facts --listen ...` serves the same payload at `GET /usage-facts`
+with optional bearer auth plus a `GET /healthz` liveness route.
+
+Each usage fact includes:
+
+- `machine_id`, `state`, `region`, `instance_id`
+- `started_at`, `stopped_at`, `deleted_at`
+- `metadata`
+- `volumes[].volume_id`
+- `volumes[].size_gib`
+
+This JSON shape is intended to be consumed by upstream metering adapters such as
+`unbox`, rather than relying on the broader `tenant list --json` output.

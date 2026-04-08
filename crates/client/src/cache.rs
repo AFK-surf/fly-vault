@@ -13,7 +13,7 @@ const LOCK_FILE_NAME: &str = "attestation-cache-v1.lock";
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_RETRY_ATTEMPTS: usize = 100;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AttestationCache {
     path: Option<PathBuf>,
     entries: Vec<CacheEntry>,
@@ -33,15 +33,6 @@ pub struct CacheEntry {
 struct StoredAttestationCache {
     #[serde(default)]
     entries: Vec<CacheEntry>,
-}
-
-impl Default for AttestationCache {
-    fn default() -> Self {
-        Self {
-            path: None,
-            entries: Vec::new(),
-        }
-    }
 }
 
 impl AttestationCache {

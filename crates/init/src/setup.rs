@@ -73,6 +73,10 @@ impl SetupManager {
         &self.root_mount_dir
     }
 
+    pub fn test_mode(&self) -> bool {
+        self.test_mode
+    }
+
     pub fn runtime_status(&mut self) -> Result<RuntimeStatus> {
         if self.test_mode {
             return Ok(if self.runtime.is_some() {

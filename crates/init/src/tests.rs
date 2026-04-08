@@ -268,8 +268,8 @@ async fn shared_connect_replays_detached_output_from_watermark() -> Result<()> {
         "printf '__FIRST__\\n'; (sleep 0.2; printf '__SECOND__\\n'; sleep 0.2; printf '__DONE__\\n') &\n",
     )
     .await?;
-    let first_output = read_console_until(&mut console_recv1, "__FIRST__").await?;
-    let rendered_bytes = first_output.len() as u64;
+    let (_, rendered_bytes) =
+        read_console_until_for_watermark(&mut console_recv1, "__FIRST__").await?;
     drop(console_send1);
     drop(console_recv1);
     drop(conn1);
@@ -425,8 +425,8 @@ async fn exec_session_replays_detached_output_and_exit_from_watermark() -> Resul
         },
     )
     .await?;
-    let first_output = read_console_until(&mut exec_recv1, "__FIRST__").await?;
-    let rendered_bytes = first_output.len() as u64;
+    let (_, rendered_bytes) =
+        read_console_until_for_watermark(&mut exec_recv1, "__FIRST__").await?;
     drop(exec_recv1);
     drop(conn1);
 
@@ -822,6 +822,27 @@ async fn read_console_until(recv: &mut quinn::RecvStream, needle: &str) -> Resul
         }
     }
     Err(anyhow!("console output did not contain marker {needle}"))
+}
+
+async fn read_console_until_for_watermark(
+    recv: &mut quinn::RecvStream,
+    needle: &str,
+) -> Result<(String, u64)> {
+    let mut out = read_console_until(recv, needle).await?.into_bytes();
+
+    // Drain any immediately available trailing console bytes so the replay watermark
+    // matches what the client would already have rendered before detach.
+    while let Ok(Ok(frame)) =
+        tokio::time::timeout(Duration::from_millis(25), ConsoleFrame::read_from(recv)).await
+    {
+        if frame.ty != CONSOLE_DATA {
+            break;
+        }
+        out.extend_from_slice(&frame.payload);
+    }
+
+    let text = String::from_utf8(out.clone()).context("watermark console output is utf-8")?;
+    Ok((text, out.len() as u64))
 }
 
 async fn wait_for_console_exit(recv: &mut quinn::RecvStream) -> Result<u32> {

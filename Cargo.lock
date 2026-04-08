@@ -411,10 +411,15 @@ name = "fly-vault-admin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "reqwest",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "toml",
  "tracing",

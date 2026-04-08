@@ -1,14 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 use crate::machines::{
-    checks_are_passing, config_image, mounted_volume_ids, with_metadata, CreateMachineRequest,
-    CreateVolumeRequest, ImageRef, Machine, MachinesClient,
+    checks_are_passing, classify_machine_action_error, config_image, mounted_volume_ids,
+    with_metadata, CreateMachineRequest, CreateVolumeRequest, ImageRef, Machine, MachineAction,
+    MachineActionDisposition, MachineUsageFact, MachinesClient, Volume, DEFAULT_VOLUME_SIZE_GIB,
 };
 use crate::template::{load_template, render_template};
 
@@ -155,7 +168,16 @@ async fn cleanup_created_machines(client: &MachinesClient, machine_ids: &[String
     let mut errors = Vec::new();
     for machine_id in machine_ids {
         if let Err(err) = client.delete_machine(machine_id, true).await {
-            errors.push(format!("delete machine {}: {}", machine_id, err));
+            match classify_machine_action_error(MachineAction::DeleteMachine, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => errors.push(format!(
+                    "delete machine {} (retryable): {}",
+                    machine_id, err
+                )),
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete machine {}: {}", machine_id, err))
+                }
+            }
         }
     }
     errors
@@ -165,7 +187,15 @@ async fn cleanup_created_volumes(client: &MachinesClient, volume_ids: &[String])
     let mut errors = Vec::new();
     for volume_id in volume_ids {
         if let Err(err) = client.delete_volume(volume_id).await {
-            errors.push(format!("delete volume {}: {}", volume_id, err));
+            match classify_machine_action_error(MachineAction::DeleteVolume, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => {
+                    errors.push(format!("delete volume {} (retryable): {}", volume_id, err))
+                }
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete volume {}: {}", volume_id, err))
+                }
+            }
         }
     }
     errors
@@ -255,7 +285,7 @@ async fn ensure_mount_volumes(
             .and_then(|mount_obj| mount_obj.get("size_gb"))
             .and_then(Value::as_u64)
             .map(|value| value as u32)
-            .or(Some(30));
+            .or(Some(DEFAULT_VOLUME_SIZE_GIB));
 
         let volume = match client
             .create_volume(&CreateVolumeRequest {
@@ -294,7 +324,8 @@ pub async fn list_tenants(
     as_json: bool,
 ) -> Result<()> {
     let machines = list_managed_machines(client, tenant).await?;
-    let grouped = group_machines_by_tenant(machines);
+    let volume_sizes = list_volume_sizes(client).await?;
+    let grouped = group_machines_by_tenant(machines, &volume_sizes);
 
     if as_json {
         println!(
@@ -311,6 +342,38 @@ pub async fn list_tenants(
     }
 
     Ok(())
+}
+
+pub async fn print_usage_facts(client: &MachinesClient, tenant: Option<&str>) -> Result<()> {
+    let facts = list_usage_facts(client, tenant).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&facts).context("serialize usage facts json")?
+    );
+    Ok(())
+}
+
+pub async fn serve_usage_facts(
+    client: &MachinesClient,
+    tenant: Option<&str>,
+    listen: &str,
+    bearer_token: Option<&str>,
+) -> Result<()> {
+    let addr: SocketAddr = listen
+        .parse()
+        .with_context(|| format!("parse listen address '{}'", listen))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind usage-facts listener on {}", addr))?;
+    let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    serve_usage_facts_with_shutdown(
+        client.clone(),
+        tenant.map(ToOwned::to_owned),
+        listener,
+        bearer_token.map(str::to_string),
+        shutdown_rx,
+    )
+    .await
 }
 
 pub async fn delete_tenant(
@@ -354,7 +417,15 @@ pub async fn delete_tenant(
 
         if machine.state == "started" {
             if let Err(err) = client.stop_machine(&machine.id).await {
-                errors.push(format!("stop {}: {}", machine.id, err));
+                match classify_machine_action_error(MachineAction::Stop, &err) {
+                    MachineActionDisposition::AlreadyApplied => {}
+                    MachineActionDisposition::Retryable => {
+                        errors.push(format!("stop {} (retryable): {}", machine.id, err))
+                    }
+                    MachineActionDisposition::Fatal => {
+                        errors.push(format!("stop {}: {}", machine.id, err))
+                    }
+                }
             } else if let Err(err) = client
                 .wait_for_state(
                     &machine.id,
@@ -369,13 +440,30 @@ pub async fn delete_tenant(
         }
 
         if let Err(err) = client.delete_machine(&machine.id, true).await {
-            errors.push(format!("delete machine {}: {}", machine.id, err));
+            match classify_machine_action_error(MachineAction::DeleteMachine, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => errors.push(format!(
+                    "delete machine {} (retryable): {}",
+                    machine.id, err
+                )),
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete machine {}: {}", machine.id, err))
+                }
+            }
         }
     }
 
     for volume_id in &volume_ids {
         if let Err(err) = client.delete_volume(volume_id).await {
-            errors.push(format!("delete volume {}: {}", volume_id, err));
+            match classify_machine_action_error(MachineAction::DeleteVolume, &err) {
+                MachineActionDisposition::AlreadyApplied => {}
+                MachineActionDisposition::Retryable => {
+                    errors.push(format!("delete volume {} (retryable): {}", volume_id, err))
+                }
+                MachineActionDisposition::Fatal => {
+                    errors.push(format!("delete volume {}: {}", volume_id, err))
+                }
+            }
         }
     }
 
@@ -403,6 +491,33 @@ pub async fn list_managed_machines(
     client: &MachinesClient,
     tenant_filter: Option<&str>,
 ) -> Result<Vec<Machine>> {
+    list_managed_machines_with_options(client, tenant_filter, false).await
+}
+
+pub async fn list_usage_facts(
+    client: &MachinesClient,
+    tenant_filter: Option<&str>,
+) -> Result<Vec<MachineUsageFact>> {
+    let volume_sizes = list_volume_sizes(client).await?;
+    Ok(usage_facts_from_machines(
+        list_managed_machines_with_options(client, tenant_filter, true).await?,
+        &volume_sizes,
+    ))
+}
+
+async fn list_volume_sizes(client: &MachinesClient) -> Result<HashMap<String, u32>> {
+    let volumes: Vec<Volume> = client.list_volumes().await?;
+    Ok(volumes
+        .into_iter()
+        .filter_map(|volume| volume.size_gb.map(|size_gb| (volume.id, size_gb)))
+        .collect())
+}
+
+async fn list_managed_machines_with_options(
+    client: &MachinesClient,
+    tenant_filter: Option<&str>,
+    include_destroyed: bool,
+) -> Result<Vec<Machine>> {
     let mut query = vec![(
         format!("metadata.{}", MANAGED_BY_KEY),
         MANAGED_BY_VALUE.to_string(),
@@ -420,7 +535,7 @@ pub async fn list_managed_machines(
             .map(|value| value == MANAGED_BY_VALUE)
             .unwrap_or(false)
             && md.contains_key(TENANT_ID_KEY)
-            && machine.state != "destroyed"
+            && (include_destroyed || !matches!(machine.state.as_str(), "destroyed" | "deleted"))
     });
 
     if let Some(tenant_id) = tenant_filter {
@@ -434,6 +549,105 @@ pub async fn list_managed_machines(
     }
 
     Ok(machines)
+}
+
+async fn serve_usage_facts_with_shutdown(
+    client: MachinesClient,
+    tenant: Option<String>,
+    listener: TcpListener,
+    bearer_token: Option<String>,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            accept = listener.accept() => {
+                let (stream, _) = accept.context("accept usage-facts connection")?;
+                let client = client.clone();
+                let tenant = tenant.clone();
+                let bearer_token = bearer_token.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        usage_facts_http_handler(
+                            client.clone(),
+                            tenant.clone(),
+                            bearer_token.clone(),
+                            req,
+                        )
+                    });
+                    if let Err(error) = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        eprintln!("usage-facts connection error: {}", error);
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn usage_facts_http_handler(
+    client: MachinesClient,
+    tenant: Option<String>,
+    bearer_token: Option<String>,
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if !is_usage_facts_authorized(&req, bearer_token.as_deref()) {
+        return Ok(json_response(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({"error":"unauthorized"}),
+        ));
+    }
+
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, "/healthz") => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from_static(b"ok")))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))),
+        (&Method::GET, "/usage-facts") => {
+            match list_usage_facts(&client, tenant.as_deref()).await {
+                Ok(facts) => Ok(json_response(StatusCode::OK, &facts)),
+                Err(error) => Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({"error": error.to_string()}),
+                )),
+            }
+        }
+        _ => Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error":"not found"}),
+        )),
+    }
+}
+
+fn is_usage_facts_authorized(req: &Request<Incoming>, bearer_token: Option<&str>) -> bool {
+    let Some(expected) = bearer_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    let Some(header_value) = req.headers().get(AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(header_value) = header_value.to_str() else {
+        return false;
+    };
+    header_value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .is_some_and(|token| token == expected)
+}
+
+fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Full<Bytes>> {
+    let payload = serde_json::to_vec(body)
+        .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(payload)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
 }
 
 #[derive(Debug, Serialize)]
@@ -466,12 +680,16 @@ struct TenantMachine {
     #[serde(skip_serializing_if = "Option::is_none")]
     image_ref: Option<ImageRef>,
     volumes: Vec<String>,
+    usage_fact: MachineUsageFact,
     config: Value,
     #[serde(skip_serializing_if = "Value::is_null")]
     checks: Value,
 }
 
-fn group_machines_by_tenant(machines: Vec<Machine>) -> Vec<TenantSummary> {
+fn group_machines_by_tenant(
+    machines: Vec<Machine>,
+    volume_sizes: &HashMap<String, u32>,
+) -> Vec<TenantSummary> {
     let mut grouped: BTreeMap<String, Vec<Machine>> = BTreeMap::new();
     for machine in machines {
         if let Some(tenant_id) = machine.metadata().get(TENANT_ID_KEY).cloned() {
@@ -484,11 +702,15 @@ fn group_machines_by_tenant(machines: Vec<Machine>) -> Vec<TenantSummary> {
 
     grouped
         .into_iter()
-        .map(|(tenant_id, machines)| summarize_tenant(tenant_id, machines))
+        .map(|(tenant_id, machines)| summarize_tenant(tenant_id, machines, volume_sizes))
         .collect()
 }
 
-fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary {
+fn summarize_tenant(
+    tenant_id: String,
+    machines: Vec<Machine>,
+    volume_sizes: &HashMap<String, u32>,
+) -> TenantSummary {
     let total = machines.len();
     let started = machines
         .iter()
@@ -506,6 +728,7 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
     let mut machine_rows = Vec::with_capacity(total);
 
     for machine in machines {
+        let usage_fact = machine.usage_fact_with_volume_sizes(volume_sizes);
         if let Some(region) = machine.region.clone() {
             regions.insert(region);
         }
@@ -530,7 +753,11 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
             images.insert(image.clone());
         }
 
-        let volumes = mounted_volume_ids(&machine);
+        let volumes = usage_fact
+            .volumes
+            .iter()
+            .map(|volume| volume.volume_id.clone())
+            .collect();
         machine_rows.push(TenantMachine {
             id: machine.id,
             name: machine.name,
@@ -543,6 +770,7 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
             image,
             image_ref: machine.image_ref,
             volumes,
+            usage_fact,
             config: machine.config,
             checks: machine.checks,
         });
@@ -569,6 +797,18 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
         last_updated_at,
         machines: machine_rows,
     }
+}
+
+fn usage_facts_from_machines(
+    machines: Vec<Machine>,
+    volume_sizes: &HashMap<String, u32>,
+) -> Vec<MachineUsageFact> {
+    let mut facts: Vec<_> = machines
+        .into_iter()
+        .map(|machine| machine.usage_fact_with_volume_sizes(volume_sizes))
+        .collect();
+    facts.sort_by(|left, right| left.machine_id.cmp(&right.machine_id));
+    facts
 }
 
 fn print_summary(tenants: &[TenantSummary]) {
@@ -718,4 +958,128 @@ pub async fn verify_soak_window(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{summarize_tenant, usage_facts_from_machines};
+    use crate::machines::Machine;
+    use serde_json::json;
+
+    #[test]
+    fn tenant_summary_machine_json_includes_usage_fact() {
+        let mut volume_sizes = HashMap::new();
+        volume_sizes.insert("vol-2".to_string(), 55);
+        let summary = summarize_tenant(
+            "tenant-1".to_string(),
+            vec![Machine {
+                id: "machine-1".to_string(),
+                name: Some("worker".to_string()),
+                state: "started".to_string(),
+                region: Some("sjc".to_string()),
+                instance_id: Some("instance-1".to_string()),
+                private_ip: Some("fdaa::1".to_string()),
+                created_at: Some("2026-04-08T00:00:00Z".to_string()),
+                updated_at: Some("2026-04-08T01:00:00Z".to_string()),
+                image_ref: None,
+                events: vec![],
+                config: json!({
+                    "metadata": {
+                        "fly_vault.tenant_id": "tenant-1",
+                        "fly_vault.managed_by": "fly-vault-admin"
+                    },
+                    "mounts": [
+                        { "volume": "vol-1", "name": "data", "path": "/data", "size_gb": 80 },
+                        { "volume": "vol-2", "name": "cache", "path": "/cache" }
+                    ]
+                }),
+                checks: json!({}),
+            }],
+            &volume_sizes,
+        );
+
+        assert_eq!(summary.machines.len(), 1);
+        let machine = &summary.machines[0];
+        assert_eq!(
+            machine.volumes,
+            vec!["vol-1".to_string(), "vol-2".to_string()]
+        );
+        assert_eq!(machine.usage_fact.machine_id, "machine-1");
+        assert_eq!(machine.usage_fact.state, "started");
+        assert_eq!(machine.usage_fact.region.as_deref(), Some("sjc"));
+        assert_eq!(machine.usage_fact.volumes.len(), 2);
+        assert_eq!(machine.usage_fact.volumes[0].volume_id, "vol-1");
+        assert_eq!(machine.usage_fact.volumes[0].size_gib, 80);
+        assert_eq!(machine.usage_fact.volumes[1].volume_id, "vol-2");
+        assert_eq!(machine.usage_fact.volumes[1].size_gib, 55);
+    }
+
+    #[test]
+    fn usage_facts_contract_is_flat_and_sorted() {
+        let facts = usage_facts_from_machines(
+            vec![
+                Machine {
+                    id: "machine-b".to_string(),
+                    name: Some("worker-b".to_string()),
+                    state: "destroyed".to_string(),
+                    region: Some("sjc".to_string()),
+                    instance_id: Some("instance-b".to_string()),
+                    private_ip: Some("fdaa::2".to_string()),
+                    created_at: Some("2026-04-08T00:00:00Z".to_string()),
+                    updated_at: Some("2026-04-08T02:00:00Z".to_string()),
+                    image_ref: None,
+                    events: vec![],
+                    config: json!({
+                        "metadata": {
+                            "fly_vault.tenant_id": "tenant-1",
+                            "fly_vault.managed_by": "fly-vault-admin",
+                            "unbox_agent_id": "agent-b"
+                        },
+                        "mounts": [
+                            { "volume": "vol-b", "size_gb": 40 }
+                        ]
+                    }),
+                    checks: json!({}),
+                },
+                Machine {
+                    id: "machine-a".to_string(),
+                    name: Some("worker-a".to_string()),
+                    state: "started".to_string(),
+                    region: Some("sjc".to_string()),
+                    instance_id: Some("instance-a".to_string()),
+                    private_ip: Some("fdaa::1".to_string()),
+                    created_at: Some("2026-04-08T00:00:00Z".to_string()),
+                    updated_at: Some("2026-04-08T01:00:00Z".to_string()),
+                    image_ref: None,
+                    events: vec![],
+                    config: json!({
+                        "metadata": {
+                            "fly_vault.tenant_id": "tenant-1",
+                            "fly_vault.managed_by": "fly-vault-admin",
+                            "unbox_agent_id": "agent-a"
+                        },
+                        "mounts": [
+                            { "volume": "vol-a", "size_gb": 20 }
+                        ]
+                    }),
+                    checks: json!({}),
+                },
+            ],
+            &HashMap::new(),
+        );
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].machine_id, "machine-a");
+        assert_eq!(facts[0].started_at.as_deref(), Some("2026-04-08T01:00:00Z"));
+        assert_eq!(facts[0].deleted_at, None);
+        assert_eq!(
+            facts[0].metadata.get("unbox_agent_id").map(String::as_str),
+            Some("agent-a")
+        );
+        assert_eq!(facts[1].machine_id, "machine-b");
+        assert_eq!(facts[1].started_at, None);
+        assert_eq!(facts[1].deleted_at.as_deref(), Some("2026-04-08T02:00:00Z"));
+    }
 }

@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::{Client, RequestBuilder, Response};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[derive(Clone)]
 pub struct MachinesClient {
@@ -14,6 +15,8 @@ pub struct MachinesClient {
     app: String,
     token: String,
 }
+
+pub const DEFAULT_VOLUME_SIZE_GIB: u32 = 30;
 
 impl MachinesClient {
     pub fn new(api_base: String, app: String, token: String) -> Self {
@@ -209,6 +212,15 @@ impl MachinesClient {
         .await
     }
 
+    pub async fn list_volumes(&self) -> Result<Vec<Volume>> {
+        send(
+            self.http
+                .get(format!("{}/v1/apps/{}/volumes", self.api_base, self.app))
+                .bearer_auth(&self.token),
+        )
+        .await
+    }
+
     fn app_path(&self, suffix: &str) -> String {
         format!("{}/v1/apps/{}/{}", self.api_base, self.app, suffix)
     }
@@ -301,6 +313,8 @@ pub struct CreateVolumeRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Volume {
     pub id: String,
+    #[serde(default)]
+    pub size_gb: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,6 +360,18 @@ pub struct Machine {
     pub config: Value,
     #[serde(default)]
     pub checks: Value,
+    #[serde(default)]
+    pub events: Vec<MachineEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MachineEvent {
+    #[serde(default, rename = "type")]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<i64>,
 }
 
 impl Machine {
@@ -363,6 +389,151 @@ impl Machine {
             })
             .unwrap_or_default()
     }
+
+    pub fn usage_fact_with_volume_sizes(
+        &self,
+        volume_sizes: &HashMap<String, u32>,
+    ) -> MachineUsageFact {
+        let (started_at, stopped_at, deleted_at) = self.lifecycle_usage_timestamps();
+        MachineUsageFact {
+            machine_id: self.id.clone(),
+            state: self.state.clone(),
+            region: self.region.clone(),
+            instance_id: self.instance_id.clone(),
+            started_at,
+            stopped_at,
+            deleted_at,
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+            metadata: self.metadata(),
+            volumes: mounted_volume_facts_with_sizes(self, volume_sizes),
+        }
+    }
+
+    fn lifecycle_usage_timestamps(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let (mut started_at, mut stopped_at, mut deleted_at) =
+            self.lifecycle_usage_timestamps_from_events();
+        let event_at = self.updated_at.clone().or_else(|| self.created_at.clone());
+
+        match self.state.trim().to_ascii_lowercase().as_str() {
+            "started" => {
+                if started_at.is_none() {
+                    started_at = event_at;
+                }
+            }
+            "stopped" => {
+                if stopped_at.is_none() {
+                    stopped_at = event_at;
+                }
+            }
+            "destroyed" | "deleted" => {
+                if deleted_at.is_none() {
+                    deleted_at = event_at;
+                }
+            }
+            _ => {}
+        }
+
+        (started_at, stopped_at, deleted_at)
+    }
+
+    fn lifecycle_usage_timestamps_from_events(
+        &self,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let mut started_at = None;
+        let mut stopped_at = None;
+        let mut deleted_at = None;
+
+        for event in &self.events {
+            let Some(timestamp) = event.timestamp.and_then(format_event_timestamp) else {
+                continue;
+            };
+            let event_type = event
+                .event_type
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let status = event
+                .status
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            if matches!(event_type.as_str(), "start") || status == "started" {
+                started_at = Some(timestamp.clone());
+            }
+            if matches!(event_type.as_str(), "stop" | "suspend")
+                || matches!(status.as_str(), "stopped" | "suspended")
+            {
+                stopped_at = Some(timestamp.clone());
+            }
+            if matches!(event_type.as_str(), "destroy" | "delete")
+                || matches!(status.as_str(), "destroyed" | "deleted")
+            {
+                deleted_at = Some(timestamp);
+            }
+        }
+
+        (started_at, stopped_at, deleted_at)
+    }
+}
+
+fn format_event_timestamp(timestamp_ms: i64) -> Option<String> {
+    let timestamp_ns = i128::from(timestamp_ms).checked_mul(1_000_000)?;
+    OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountedVolumeFact {
+    pub volume_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
+    pub size_gib: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineUsageFact {
+    pub machine_id: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<MountedVolumeFact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineAction {
+    Stop,
+    DeleteMachine,
+    DeleteVolume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineActionDisposition {
+    AlreadyApplied,
+    Retryable,
+    Fatal,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -404,7 +575,14 @@ pub fn with_image(config: &Value, image: &str) -> Result<Value> {
     Ok(out)
 }
 
-pub fn mounted_volume_ids(machine: &Machine) -> Vec<String> {
+pub fn mounted_volume_facts(machine: &Machine) -> Vec<MountedVolumeFact> {
+    mounted_volume_facts_with_sizes(machine, &HashMap::new())
+}
+
+pub fn mounted_volume_facts_with_sizes(
+    machine: &Machine,
+    volume_sizes: &HashMap<String, u32>,
+) -> Vec<MountedVolumeFact> {
     machine
         .config
         .as_object()
@@ -413,13 +591,83 @@ pub fn mounted_volume_ids(machine: &Machine) -> Vec<String> {
         .map(|mounts| {
             mounts
                 .iter()
-                .filter_map(|mount| mount.as_object())
-                .filter_map(|mount| mount.get("volume"))
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
+                .filter_map(Value::as_object)
+                .filter_map(|mount| {
+                    let volume_id = mount
+                        .get("volume")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?
+                        .to_string();
+                    let name = mount
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned);
+                    let mount_path = mount
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned);
+                    let size_gib = mount
+                        .get("size_gb")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32);
+                    let size_gib = volume_sizes
+                        .get(&volume_id)
+                        .copied()
+                        .or(size_gib)
+                        .unwrap_or(DEFAULT_VOLUME_SIZE_GIB);
+
+                    Some(MountedVolumeFact {
+                        volume_id,
+                        name,
+                        mount_path,
+                        size_gib,
+                    })
+                })
+                .collect()
         })
         .unwrap_or_default()
+}
+
+pub fn mounted_volume_ids(machine: &Machine) -> Vec<String> {
+    mounted_volume_facts(machine)
+        .into_iter()
+        .map(|volume| volume.volume_id)
+        .collect()
+}
+
+pub fn classify_machine_action_error(
+    action: MachineAction,
+    err: &anyhow::Error,
+) -> MachineActionDisposition {
+    let Some(api_error) = err.downcast_ref::<ApiError>() else {
+        return MachineActionDisposition::Fatal;
+    };
+
+    match api_error.status {
+        StatusCode::REQUEST_TIMEOUT
+        | StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT
+        | StatusCode::INTERNAL_SERVER_ERROR => MachineActionDisposition::Retryable,
+        StatusCode::NOT_FOUND => match action {
+            MachineAction::Stop | MachineAction::DeleteMachine | MachineAction::DeleteVolume => {
+                MachineActionDisposition::AlreadyApplied
+            }
+        },
+        StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY => match action {
+            MachineAction::Stop => MachineActionDisposition::AlreadyApplied,
+            MachineAction::DeleteMachine | MachineAction::DeleteVolume => {
+                MachineActionDisposition::Fatal
+            }
+        },
+        _ => MachineActionDisposition::Fatal,
+    }
 }
 
 pub fn checks_are_passing(checks: &Value) -> Option<bool> {
@@ -458,7 +706,15 @@ fn collect_statuses(value: &Value, out: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_wait_timeout, ApiError};
+    use std::collections::HashMap;
+
+    use serde_json::{json, Value};
+
+    use super::{
+        classify_machine_action_error, is_wait_timeout, mounted_volume_facts, mounted_volume_ids,
+        ApiError, Machine, MachineAction, MachineActionDisposition, MachineEvent,
+        DEFAULT_VOLUME_SIZE_GIB,
+    };
 
     #[test]
     fn wait_timeout_detects_structured_408_error() {
@@ -476,5 +732,190 @@ mod tests {
             body: "bad request".to_string(),
         });
         assert!(!is_wait_timeout(&err));
+    }
+
+    #[test]
+    fn mounted_volume_facts_extract_size_and_default() {
+        let machine = Machine {
+            id: "machine-1".to_string(),
+            name: Some("worker".to_string()),
+            state: "started".to_string(),
+            region: Some("sjc".to_string()),
+            instance_id: Some("inst-1".to_string()),
+            private_ip: None,
+            created_at: Some("2026-04-07T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-07T00:05:00Z".to_string()),
+            image_ref: None,
+            checks: Value::Null,
+            events: vec![],
+            config: json!({
+                "metadata": { "fly_vault.tenant_id": "tenant-1" },
+                "mounts": [
+                    { "volume": "vol-explicit", "name": "data", "path": "/data", "size_gb": 64 },
+                    { "volume": "vol-default", "path": "/cache" }
+                ]
+            }),
+        };
+
+        let facts = mounted_volume_facts(&machine);
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].volume_id, "vol-explicit");
+        assert_eq!(facts[0].name.as_deref(), Some("data"));
+        assert_eq!(facts[0].mount_path.as_deref(), Some("/data"));
+        assert_eq!(facts[0].size_gib, 64);
+        assert_eq!(facts[1].volume_id, "vol-default");
+        assert_eq!(facts[1].size_gib, DEFAULT_VOLUME_SIZE_GIB);
+        assert_eq!(
+            mounted_volume_ids(&machine),
+            vec!["vol-explicit".to_string(), "vol-default".to_string()]
+        );
+    }
+
+    #[test]
+    fn machine_usage_fact_preserves_runtime_fields() {
+        let machine = Machine {
+            id: "machine-1".to_string(),
+            name: Some("worker".to_string()),
+            state: "stopped".to_string(),
+            region: Some("sjc".to_string()),
+            instance_id: Some("inst-1".to_string()),
+            private_ip: None,
+            created_at: Some("2026-04-07T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-07T00:05:00Z".to_string()),
+            image_ref: None,
+            checks: Value::Null,
+            events: vec![
+                MachineEvent {
+                    event_type: Some("start".to_string()),
+                    status: Some("started".to_string()),
+                    timestamp: Some(1_755_331_200_000),
+                },
+                MachineEvent {
+                    event_type: Some("stop".to_string()),
+                    status: Some("stopped".to_string()),
+                    timestamp: Some(1_755_331_500_000),
+                },
+            ],
+            config: json!({
+                "metadata": {
+                    "fly_vault.tenant_id": "tenant-1",
+                    "fly_vault.managed_by": "fly-vault-admin"
+                },
+                "mounts": [
+                    { "volume": "vol-1", "size_gb": 80 }
+                ]
+            }),
+        };
+
+        let fact = machine.usage_fact_with_volume_sizes(&HashMap::new());
+        assert_eq!(fact.machine_id, "machine-1");
+        assert_eq!(fact.state, "stopped");
+        assert_eq!(fact.region.as_deref(), Some("sjc"));
+        assert_eq!(fact.instance_id.as_deref(), Some("inst-1"));
+        assert_eq!(fact.started_at.as_deref(), Some("2025-08-16T08:00:00Z"));
+        assert_eq!(fact.stopped_at.as_deref(), Some("2025-08-16T08:05:00Z"));
+        assert_eq!(fact.deleted_at, None);
+        assert_eq!(fact.created_at.as_deref(), Some("2026-04-07T00:00:00Z"));
+        assert_eq!(fact.updated_at.as_deref(), Some("2026-04-07T00:05:00Z"));
+        assert_eq!(
+            fact.metadata.get("fly_vault.tenant_id").map(String::as_str),
+            Some("tenant-1")
+        );
+        assert_eq!(fact.volumes.len(), 1);
+        assert_eq!(fact.volumes[0].volume_id, "vol-1");
+        assert_eq!(fact.volumes[0].size_gib, 80);
+    }
+
+    #[test]
+    fn machine_usage_fact_marks_deleted_lifecycle() {
+        let machine = Machine {
+            id: "machine-1".to_string(),
+            name: Some("worker".to_string()),
+            state: "destroyed".to_string(),
+            region: Some("sjc".to_string()),
+            instance_id: Some("inst-1".to_string()),
+            private_ip: None,
+            created_at: Some("2026-04-07T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-07T00:05:00Z".to_string()),
+            image_ref: None,
+            checks: Value::Null,
+            events: vec![MachineEvent {
+                event_type: Some("destroy".to_string()),
+                status: Some("destroyed".to_string()),
+                timestamp: Some(1_755_331_500_000),
+            }],
+            config: json!({
+                "metadata": {
+                    "fly_vault.tenant_id": "tenant-1"
+                },
+                "mounts": [
+                    { "volume": "vol-1", "size_gb": 80 }
+                ]
+            }),
+        };
+
+        let fact = machine.usage_fact_with_volume_sizes(&HashMap::new());
+        assert_eq!(fact.started_at, None);
+        assert_eq!(fact.stopped_at, None);
+        assert_eq!(fact.deleted_at.as_deref(), Some("2025-08-16T08:05:00Z"));
+    }
+
+    #[test]
+    fn classify_machine_action_error_treats_idempotent_paths_as_already_applied() {
+        let not_found = anyhow::Error::new(ApiError {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "missing".to_string(),
+        });
+        assert_eq!(
+            classify_machine_action_error(MachineAction::DeleteMachine, &not_found),
+            MachineActionDisposition::AlreadyApplied
+        );
+        assert_eq!(
+            classify_machine_action_error(MachineAction::DeleteVolume, &not_found),
+            MachineActionDisposition::AlreadyApplied
+        );
+        assert_eq!(
+            classify_machine_action_error(MachineAction::Stop, &not_found),
+            MachineActionDisposition::AlreadyApplied
+        );
+
+        let already_stopped = anyhow::Error::new(ApiError {
+            status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            body: "already stopped".to_string(),
+        });
+        assert_eq!(
+            classify_machine_action_error(MachineAction::Stop, &already_stopped),
+            MachineActionDisposition::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn classify_machine_action_error_marks_retryable_and_fatal_failures() {
+        let timeout = anyhow::Error::new(ApiError {
+            status: reqwest::StatusCode::REQUEST_TIMEOUT,
+            body: "timeout".to_string(),
+        });
+        assert_eq!(
+            classify_machine_action_error(MachineAction::DeleteMachine, &timeout),
+            MachineActionDisposition::Retryable
+        );
+
+        let unavailable = anyhow::Error::new(ApiError {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: "busy".to_string(),
+        });
+        assert_eq!(
+            classify_machine_action_error(MachineAction::DeleteVolume, &unavailable),
+            MachineActionDisposition::Retryable
+        );
+
+        let bad_request = anyhow::Error::new(ApiError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "bad request".to_string(),
+        });
+        assert_eq!(
+            classify_machine_action_error(MachineAction::DeleteMachine, &bad_request),
+            MachineActionDisposition::Fatal
+        );
     }
 }

@@ -113,7 +113,7 @@ async fn handle_connection(
                 let _ = send.reset(quinn::VarInt::from_u32(1));
             }
             STREAM_CONSOLE => {
-                let (console, exec_sessions, root_dir, inner_pid) = {
+                let (console, exec_sessions, root_dir, inner_pid, test_mode) = {
                     let mut guard = shared.lock().await;
                     let inner_pid = match guard.setup.ensure_live_inner_init_pid() {
                         Ok(pid) => pid,
@@ -128,6 +128,7 @@ async fn handle_connection(
                         Arc::clone(&guard.exec_sessions),
                         guard.setup.root_mount_dir().to_path_buf(),
                         inner_pid,
+                        guard.setup.test_mode(),
                     )
                 };
                 tokio::spawn(async move {
@@ -138,6 +139,7 @@ async fn handle_connection(
                         exec_sessions,
                         &root_dir,
                         inner_pid,
+                        test_mode,
                     )
                     .await
                     {

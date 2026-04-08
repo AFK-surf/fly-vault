@@ -87,6 +87,7 @@ impl SharedConsoleManager {
         &self,
         root_dir: &Path,
         inner_pid: Pid,
+        test_mode: bool,
         rendered_bytes: u64,
     ) -> Result<SharedConsoleAttachment> {
         loop {
@@ -95,7 +96,8 @@ impl SharedConsoleManager {
                 match guard.as_ref() {
                     Some(existing) if !existing.is_finished() => Arc::clone(existing),
                     _ => {
-                        let session = Arc::new(SharedConsoleSession::spawn(root_dir, inner_pid)?);
+                        let session =
+                            Arc::new(SharedConsoleSession::spawn(root_dir, inner_pid, test_mode)?);
                         *guard = Some(Arc::clone(&session));
                         session
                     }
@@ -152,6 +154,7 @@ impl ExecSessionManager {
         self: &Arc<Self>,
         root_dir: &Path,
         inner_pid: Pid,
+        test_mode: bool,
         request: ExecSessionRequest,
     ) -> Result<ExecSessionAttachment> {
         let session = {
@@ -171,6 +174,7 @@ impl ExecSessionManager {
                 let session = Arc::new(ExecSession::spawn(
                     root_dir,
                     inner_pid,
+                    test_mode,
                     request.session_id.clone(),
                     argv,
                     request.context.clone(),
@@ -216,12 +220,13 @@ struct SharedConsoleSession {
 }
 
 impl SharedConsoleSession {
-    fn spawn(root_dir: &Path, inner_pid: Pid) -> Result<Self> {
+    fn spawn(root_dir: &Path, inner_pid: Pid, test_mode: bool) -> Result<Self> {
         Ok(Self {
             runtime: spawn_persistent_console(
                 ConsoleLaunch::Shell,
                 root_dir,
                 inner_pid,
+                test_mode,
                 "shared console shell",
             )?,
         })
@@ -255,6 +260,7 @@ impl ExecSession {
     fn spawn(
         root_dir: &Path,
         inner_pid: Pid,
+        test_mode: bool,
         session_id: String,
         argv: Vec<String>,
         context: Option<String>,
@@ -268,6 +274,7 @@ impl ExecSession {
                 ConsoleLaunch::Exec(argv),
                 root_dir,
                 inner_pid,
+                test_mode,
                 "persistent exec session",
             )?,
             attachment: Mutex::new(ExecAttachmentState::default()),
@@ -481,6 +488,7 @@ pub async fn handle_console_stream(
     exec_sessions: Arc<ExecSessionManager>,
     root_dir: &Path,
     inner_pid: Pid,
+    test_mode: bool,
 ) -> Result<()> {
     let startup = ConsoleFrame::read_from(&mut recv).await?;
 
@@ -493,14 +501,23 @@ pub async fn handle_console_stream(
                 shared_console,
                 root_dir,
                 inner_pid,
+                test_mode,
                 request.rendered_bytes,
             )
             .await
         }
         CONSOLE_EXEC => {
             let request = ExecSessionRequest::from_bytes(&startup.payload)?;
-            handle_exec_session_stream(send, recv, exec_sessions, root_dir, inner_pid, request)
-                .await
+            handle_exec_session_stream(
+                send,
+                recv,
+                exec_sessions,
+                root_dir,
+                inner_pid,
+                test_mode,
+                request,
+            )
+            .await
         }
         other => Err(anyhow!("unexpected initial console frame type: {other}")),
     }
@@ -524,6 +541,7 @@ async fn handle_shared_console_stream(
     shared_console: Arc<SharedConsoleManager>,
     root_dir: &Path,
     inner_pid: Pid,
+    test_mode: bool,
     rendered_bytes: u64,
 ) -> Result<()> {
     let SharedConsoleAttachment {
@@ -532,7 +550,7 @@ async fn handle_shared_console_stream(
         output_subscription,
         exit_code,
     } = shared_console
-        .attach(root_dir, inner_pid, rendered_bytes)
+        .attach(root_dir, inner_pid, test_mode, rendered_bytes)
         .await?;
 
     let session_to_client = async {
@@ -563,6 +581,7 @@ async fn handle_exec_session_stream(
     exec_sessions: Arc<ExecSessionManager>,
     root_dir: &Path,
     inner_pid: Pid,
+    test_mode: bool,
     request: ExecSessionRequest,
 ) -> Result<()> {
     let ExecSessionAttachment {
@@ -574,7 +593,7 @@ async fn handle_exec_session_stream(
         takeover,
         generation,
     } = exec_sessions
-        .attach_or_create(root_dir, inner_pid, request)
+        .attach_or_create(root_dir, inner_pid, test_mode, request)
         .await?;
 
     let session_to_client = async {
@@ -606,15 +625,16 @@ fn spawn_persistent_console(
     launch: ConsoleLaunch,
     root_dir: &Path,
     inner_pid: Pid,
+    test_mode: bool,
     wait_label: &'static str,
 ) -> Result<PersistentConsoleRuntime> {
     let (master_fd, slave_fd) = open_pty().context("allocate pty pair")?;
 
-    let mut cmd = build_console_command(&launch, root_dir, inner_pid);
+    let mut cmd = build_console_command(&launch, root_dir, inner_pid, test_mode);
     configure_console_stdio(&mut cmd, &slave_fd)?;
     let child = cmd
         .spawn()
-        .with_context(|| launch.spawn_context(inner_pid))?;
+        .with_context(|| launch.spawn_context(inner_pid, test_mode))?;
 
     drop(slave_fd);
 
@@ -882,7 +902,14 @@ impl ConsoleLaunch {
         }
     }
 
-    fn spawn_context(&self, inner_pid: Pid) -> String {
+    fn spawn_context(&self, inner_pid: Pid, test_mode: bool) -> String {
+        if test_mode {
+            return match self {
+                Self::Shell => "spawn shared console shell in test mode".to_string(),
+                Self::Exec(argv) => format!("spawn test-mode exec {:?}", argv),
+            };
+        }
+
         match self {
             Self::Shell => format!("spawn nsenter console via pid {}", inner_pid.as_raw()),
             Self::Exec(argv) => format!(
@@ -894,7 +921,30 @@ impl ConsoleLaunch {
     }
 }
 
-fn build_console_command(launch: &ConsoleLaunch, root_dir: &Path, inner_pid: Pid) -> Command {
+fn build_console_command(
+    launch: &ConsoleLaunch,
+    root_dir: &Path,
+    inner_pid: Pid,
+    test_mode: bool,
+) -> Command {
+    if test_mode {
+        let cmd = match launch {
+            ConsoleLaunch::Shell => {
+                let mut cmd = Command::new(ConsoleLaunch::shell_path(root_dir));
+                cmd.current_dir(root_dir)
+                    .env("HOME", root_dir.join("root"))
+                    .env("PWD", root_dir);
+                cmd
+            }
+            ConsoleLaunch::Exec(argv) => {
+                let mut cmd = Command::new(&argv[0]);
+                cmd.args(&argv[1..]).current_dir(root_dir);
+                cmd
+            }
+        };
+        return cmd;
+    }
+
     let mut cmd = Command::new("nsenter");
     cmd.args([
         "-m",
@@ -927,7 +977,7 @@ fn configure_console_stdio(cmd: &mut Command, slave_fd: &OwnedFd) -> Result<()> 
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+            if libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -1080,6 +1130,7 @@ mod tests {
             &ConsoleLaunch::Exec(vec!["ls".to_string(), "-lash".to_string(), "/".to_string()]),
             Path::new("/tmp/rootfs"),
             Pid::from_raw(42),
+            false,
         );
 
         let args = cmd
@@ -1102,6 +1153,29 @@ mod tests {
                 "/",
             ]
         );
+    }
+
+    #[test]
+    fn build_console_command_avoids_nsenter_in_test_mode() {
+        let cmd = build_console_command(
+            &ConsoleLaunch::Shell,
+            Path::new("/tmp/rootfs"),
+            Pid::from_raw(42),
+            true,
+        );
+
+        assert_eq!(cmd.as_std().get_program(), "/bin/sh");
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(Path::new("/tmp/rootfs"))
+        );
+
+        let args = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(args.is_empty());
     }
 
     #[test]

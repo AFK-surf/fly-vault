@@ -300,12 +300,6 @@ pub struct CreateVolumeRequest {
     pub size_gb: Option<u32>,
 }
 
-impl CreateVolumeRequest {
-    pub fn size_gib_or_default(&self) -> u32 {
-        self.size_gb.unwrap_or(DEFAULT_VOLUME_SIZE_GIB)
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Volume {
     pub id: String,
@@ -612,8 +606,7 @@ mod tests {
 
     use super::{
         classify_machine_action_error, is_wait_timeout, mounted_volume_facts, mounted_volume_ids,
-        ApiError, CreateVolumeRequest, Machine, MachineAction, MachineActionDisposition,
-        DEFAULT_VOLUME_SIZE_GIB,
+        ApiError, Machine, MachineAction, MachineActionDisposition, DEFAULT_VOLUME_SIZE_GIB,
     };
 
     #[test]
@@ -799,22 +792,5 @@ mod tests {
             classify_machine_action_error(MachineAction::DeleteMachine, &bad_request),
             MachineActionDisposition::Fatal
         );
-    }
-
-    #[test]
-    fn create_volume_request_uses_explicit_or_default_size() {
-        let explicit = CreateVolumeRequest {
-            name: "data".to_string(),
-            region: Some("sjc".to_string()),
-            size_gb: Some(80),
-        };
-        assert_eq!(explicit.size_gib_or_default(), 80);
-
-        let defaulted = CreateVolumeRequest {
-            name: "cache".to_string(),
-            region: Some("sjc".to_string()),
-            size_gb: None,
-        };
-        assert_eq!(defaulted.size_gib_or_default(), DEFAULT_VOLUME_SIZE_GIB);
     }
 }

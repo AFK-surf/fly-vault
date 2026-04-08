@@ -48,7 +48,7 @@ fn build_server_config() -> Result<ServerConfig> {
     let cert_der = cert.cert.der().clone();
     let key_der = cert.key_pair.serialize_der();
 
-    let cert_chain = vec![rustls_pki_types::CertificateDer::from(cert_der)];
+    let cert_chain = vec![cert_der];
     let key = rustls_pki_types::PrivatePkcs8KeyDer::from(key_der);
 
     let mut tls = rustls::ServerConfig::builder()

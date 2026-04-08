@@ -391,7 +391,7 @@ impl BufferedConsoleOutput {
     fn push_exit(&self, _code: u32) {
         // Exit is detected via the exit_code mutex; just bump the watch
         // so any waiters wake up and can check.
-        self.notify_tx.send_modify(|v| *v = *v);
+        self.notify_tx.send_modify(|v| *v = v.saturating_add(1));
     }
 }
 
@@ -977,7 +977,26 @@ fn configure_console_stdio(cmd: &mut Command, slave_fd: &OwnedFd) -> Result<()> 
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            let tiocsctty: libc::c_ulong = libc::TIOCSCTTY.into();
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            )))]
+            let tiocsctty = libc::TIOCSCTTY;
+
+            if libc::ioctl(0, tiocsctty, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -1111,6 +1130,36 @@ fn set_pty_winsize(fd: libc::c_int, rows: u16, cols: u16) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Port-forward helpers
+// ---------------------------------------------------------------------------
+
+async fn read_target_addr(recv: &mut quinn::RecvStream) -> Result<String> {
+    let mut bytes = Vec::with_capacity(128);
+    let mut one = [0u8; 1];
+    loop {
+        let n = recv
+            .read(&mut one)
+            .await
+            .context("read target header byte")?;
+        let Some(n) = n else {
+            return Err(anyhow!("unexpected EOF while reading target header"));
+        };
+        if n == 0 {
+            continue;
+        }
+        if one[0] == 0 {
+            break;
+        }
+        bytes.push(one[0]);
+        if bytes.len() > 1024 {
+            return Err(anyhow!("target address header too long"));
+        }
+    }
+
+    String::from_utf8(bytes).context("target address not utf-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,34 +1257,4 @@ mod tests {
         assert!(!second.takeover.is_cancelled());
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Port-forward helpers
-// ---------------------------------------------------------------------------
-
-async fn read_target_addr(recv: &mut quinn::RecvStream) -> Result<String> {
-    let mut bytes = Vec::with_capacity(128);
-    let mut one = [0u8; 1];
-    loop {
-        let n = recv
-            .read(&mut one)
-            .await
-            .context("read target header byte")?;
-        let Some(n) = n else {
-            return Err(anyhow!("unexpected EOF while reading target header"));
-        };
-        if n == 0 {
-            continue;
-        }
-        if one[0] == 0 {
-            break;
-        }
-        bytes.push(one[0]);
-        if bytes.len() > 1024 {
-            return Err(anyhow!("target address header too long"));
-        }
-    }
-
-    String::from_utf8(bytes).context("target address not utf-8")
 }

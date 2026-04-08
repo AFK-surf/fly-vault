@@ -41,7 +41,9 @@ table inet filter {{
         .take()
         .context("open stdin pipe")
         .and_then(|mut stdin| {
-            stdin.write_all(ruleset.as_bytes()).context("write ruleset")?;
+            stdin
+                .write_all(ruleset.as_bytes())
+                .context("write ruleset")?;
             Ok(())
         })?;
 

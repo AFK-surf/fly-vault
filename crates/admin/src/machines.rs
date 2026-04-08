@@ -373,18 +373,30 @@ impl Machine {
     }
 
     pub fn usage_fact(&self) -> MachineUsageFact {
+        let (started_at, stopped_at, deleted_at) = self.lifecycle_usage_timestamps();
         MachineUsageFact {
             machine_id: self.id.clone(),
             state: self.state.clone(),
             region: self.region.clone(),
             instance_id: self.instance_id.clone(),
-            started_at: None,
-            stopped_at: None,
-            deleted_at: None,
+            started_at,
+            stopped_at,
+            deleted_at,
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
             metadata: self.metadata(),
             volumes: mounted_volume_facts(self),
+        }
+    }
+
+    fn lifecycle_usage_timestamps(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let event_at = self.updated_at.clone().or_else(|| self.created_at.clone());
+
+        match self.state.trim().to_ascii_lowercase().as_str() {
+            "started" => (event_at, None, None),
+            "stopped" => (None, event_at, None),
+            "destroyed" | "deleted" => (None, None, event_at),
+            _ => (None, None, None),
         }
     }
 }
@@ -687,6 +699,9 @@ mod tests {
         assert_eq!(fact.state, "stopped");
         assert_eq!(fact.region.as_deref(), Some("sjc"));
         assert_eq!(fact.instance_id.as_deref(), Some("inst-1"));
+        assert_eq!(fact.started_at, None);
+        assert_eq!(fact.stopped_at.as_deref(), Some("2026-04-07T00:05:00Z"));
+        assert_eq!(fact.deleted_at, None);
         assert_eq!(fact.created_at.as_deref(), Some("2026-04-07T00:00:00Z"));
         assert_eq!(fact.updated_at.as_deref(), Some("2026-04-07T00:05:00Z"));
         assert_eq!(
@@ -696,6 +711,35 @@ mod tests {
         assert_eq!(fact.volumes.len(), 1);
         assert_eq!(fact.volumes[0].volume_id, "vol-1");
         assert_eq!(fact.volumes[0].size_gib, 80);
+    }
+
+    #[test]
+    fn machine_usage_fact_marks_deleted_lifecycle() {
+        let machine = Machine {
+            id: "machine-1".to_string(),
+            name: Some("worker".to_string()),
+            state: "destroyed".to_string(),
+            region: Some("sjc".to_string()),
+            instance_id: Some("inst-1".to_string()),
+            private_ip: None,
+            created_at: Some("2026-04-07T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-07T00:05:00Z".to_string()),
+            image_ref: None,
+            checks: Value::Null,
+            config: json!({
+                "metadata": {
+                    "fly_vault.tenant_id": "tenant-1"
+                },
+                "mounts": [
+                    { "volume": "vol-1", "size_gb": 80 }
+                ]
+            }),
+        };
+
+        let fact = machine.usage_fact();
+        assert_eq!(fact.started_at, None);
+        assert_eq!(fact.stopped_at, None);
+        assert_eq!(fact.deleted_at.as_deref(), Some("2026-04-07T00:05:00Z"));
     }
 
     #[test]

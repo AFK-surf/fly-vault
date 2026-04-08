@@ -41,6 +41,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 url = "2"
+time = { version = "0.3", features = ["formatting"] }
 
 # HTTP server (control socket)
 hyper = { version = "1", features = ["http1", "server"] }

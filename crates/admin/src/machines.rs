@@ -6,6 +6,7 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[derive(Clone)]
 pub struct MachinesClient {
@@ -211,6 +212,15 @@ impl MachinesClient {
         .await
     }
 
+    pub async fn list_volumes(&self) -> Result<Vec<Volume>> {
+        send(
+            self.http
+                .get(format!("{}/v1/apps/{}/volumes", self.api_base, self.app))
+                .bearer_auth(&self.token),
+        )
+        .await
+    }
+
     fn app_path(&self, suffix: &str) -> String {
         format!("{}/v1/apps/{}/{}", self.api_base, self.app, suffix)
     }
@@ -303,6 +313,8 @@ pub struct CreateVolumeRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Volume {
     pub id: String,
+    #[serde(default)]
+    pub size_gb: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -348,6 +360,18 @@ pub struct Machine {
     pub config: Value,
     #[serde(default)]
     pub checks: Value,
+    #[serde(default)]
+    pub events: Vec<MachineEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MachineEvent {
+    #[serde(default, rename = "type")]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<i64>,
 }
 
 impl Machine {
@@ -366,7 +390,10 @@ impl Machine {
             .unwrap_or_default()
     }
 
-    pub fn usage_fact(&self) -> MachineUsageFact {
+    pub fn usage_fact_with_volume_sizes(
+        &self,
+        volume_sizes: &HashMap<String, u32>,
+    ) -> MachineUsageFact {
         let (started_at, stopped_at, deleted_at) = self.lifecycle_usage_timestamps();
         MachineUsageFact {
             machine_id: self.id.clone(),
@@ -379,20 +406,86 @@ impl Machine {
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
             metadata: self.metadata(),
-            volumes: mounted_volume_facts(self),
+            volumes: mounted_volume_facts_with_sizes(self, volume_sizes),
         }
     }
 
     fn lifecycle_usage_timestamps(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let (mut started_at, mut stopped_at, mut deleted_at) =
+            self.lifecycle_usage_timestamps_from_events();
         let event_at = self.updated_at.clone().or_else(|| self.created_at.clone());
 
         match self.state.trim().to_ascii_lowercase().as_str() {
-            "started" => (event_at, None, None),
-            "stopped" => (None, event_at, None),
-            "destroyed" | "deleted" => (None, None, event_at),
-            _ => (None, None, None),
+            "started" => {
+                if started_at.is_none() {
+                    started_at = event_at;
+                }
+            }
+            "stopped" => {
+                if stopped_at.is_none() {
+                    stopped_at = event_at;
+                }
+            }
+            "destroyed" | "deleted" => {
+                if deleted_at.is_none() {
+                    deleted_at = event_at;
+                }
+            }
+            _ => {}
         }
+
+        (started_at, stopped_at, deleted_at)
     }
+
+    fn lifecycle_usage_timestamps_from_events(
+        &self,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let mut started_at = None;
+        let mut stopped_at = None;
+        let mut deleted_at = None;
+
+        for event in &self.events {
+            let Some(timestamp) = event.timestamp.and_then(format_event_timestamp) else {
+                continue;
+            };
+            let event_type = event
+                .event_type
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let status = event
+                .status
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            if matches!(event_type.as_str(), "start") || status == "started" {
+                started_at = Some(timestamp.clone());
+            }
+            if matches!(event_type.as_str(), "stop" | "suspend")
+                || matches!(status.as_str(), "stopped" | "suspended")
+            {
+                stopped_at = Some(timestamp.clone());
+            }
+            if matches!(event_type.as_str(), "destroy" | "delete")
+                || matches!(status.as_str(), "destroyed" | "deleted")
+            {
+                deleted_at = Some(timestamp);
+            }
+        }
+
+        (started_at, stopped_at, deleted_at)
+    }
+}
+
+fn format_event_timestamp(timestamp_ms: i64) -> Option<String> {
+    let timestamp_ns = i128::from(timestamp_ms).checked_mul(1_000_000)?;
+    OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +576,13 @@ pub fn with_image(config: &Value, image: &str) -> Result<Value> {
 }
 
 pub fn mounted_volume_facts(machine: &Machine) -> Vec<MountedVolumeFact> {
+    mounted_volume_facts_with_sizes(machine, &HashMap::new())
+}
+
+pub fn mounted_volume_facts_with_sizes(
+    machine: &Machine,
+    volume_sizes: &HashMap<String, u32>,
+) -> Vec<MountedVolumeFact> {
     machine
         .config
         .as_object()
@@ -514,7 +614,11 @@ pub fn mounted_volume_facts(machine: &Machine) -> Vec<MountedVolumeFact> {
                     let size_gib = mount
                         .get("size_gb")
                         .and_then(Value::as_u64)
-                        .map(|value| value as u32)
+                        .map(|value| value as u32);
+                    let size_gib = volume_sizes
+                        .get(&volume_id)
+                        .copied()
+                        .or(size_gib)
                         .unwrap_or(DEFAULT_VOLUME_SIZE_GIB);
 
                     Some(MountedVolumeFact {
@@ -602,11 +706,14 @@ fn collect_statuses(value: &Value, out: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use serde_json::{json, Value};
 
     use super::{
         classify_machine_action_error, is_wait_timeout, mounted_volume_facts, mounted_volume_ids,
-        ApiError, Machine, MachineAction, MachineActionDisposition, DEFAULT_VOLUME_SIZE_GIB,
+        ApiError, Machine, MachineAction, MachineActionDisposition, MachineEvent,
+        DEFAULT_VOLUME_SIZE_GIB,
     };
 
     #[test]
@@ -640,6 +747,7 @@ mod tests {
             updated_at: Some("2026-04-07T00:05:00Z".to_string()),
             image_ref: None,
             checks: Value::Null,
+            events: vec![],
             config: json!({
                 "metadata": { "fly_vault.tenant_id": "tenant-1" },
                 "mounts": [
@@ -676,6 +784,18 @@ mod tests {
             updated_at: Some("2026-04-07T00:05:00Z".to_string()),
             image_ref: None,
             checks: Value::Null,
+            events: vec![
+                MachineEvent {
+                    event_type: Some("start".to_string()),
+                    status: Some("started".to_string()),
+                    timestamp: Some(1_755_331_200_000),
+                },
+                MachineEvent {
+                    event_type: Some("stop".to_string()),
+                    status: Some("stopped".to_string()),
+                    timestamp: Some(1_755_331_500_000),
+                },
+            ],
             config: json!({
                 "metadata": {
                     "fly_vault.tenant_id": "tenant-1",
@@ -687,13 +807,13 @@ mod tests {
             }),
         };
 
-        let fact = machine.usage_fact();
+        let fact = machine.usage_fact_with_volume_sizes(&HashMap::new());
         assert_eq!(fact.machine_id, "machine-1");
         assert_eq!(fact.state, "stopped");
         assert_eq!(fact.region.as_deref(), Some("sjc"));
         assert_eq!(fact.instance_id.as_deref(), Some("inst-1"));
-        assert_eq!(fact.started_at, None);
-        assert_eq!(fact.stopped_at.as_deref(), Some("2026-04-07T00:05:00Z"));
+        assert_eq!(fact.started_at.as_deref(), Some("2025-08-16T08:00:00Z"));
+        assert_eq!(fact.stopped_at.as_deref(), Some("2025-08-16T08:05:00Z"));
         assert_eq!(fact.deleted_at, None);
         assert_eq!(fact.created_at.as_deref(), Some("2026-04-07T00:00:00Z"));
         assert_eq!(fact.updated_at.as_deref(), Some("2026-04-07T00:05:00Z"));
@@ -719,6 +839,11 @@ mod tests {
             updated_at: Some("2026-04-07T00:05:00Z".to_string()),
             image_ref: None,
             checks: Value::Null,
+            events: vec![MachineEvent {
+                event_type: Some("destroy".to_string()),
+                status: Some("destroyed".to_string()),
+                timestamp: Some(1_755_331_500_000),
+            }],
             config: json!({
                 "metadata": {
                     "fly_vault.tenant_id": "tenant-1"
@@ -729,10 +854,10 @@ mod tests {
             }),
         };
 
-        let fact = machine.usage_fact();
+        let fact = machine.usage_fact_with_volume_sizes(&HashMap::new());
         assert_eq!(fact.started_at, None);
         assert_eq!(fact.stopped_at, None);
-        assert_eq!(fact.deleted_at.as_deref(), Some("2026-04-07T00:05:00Z"));
+        assert_eq!(fact.deleted_at.as_deref(), Some("2025-08-16T08:05:00Z"));
     }
 
     #[test]

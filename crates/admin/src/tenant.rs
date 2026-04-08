@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 use crate::machines::{
     checks_are_passing, classify_machine_action_error, config_image, mounted_volume_ids,
     with_metadata, CreateMachineRequest, CreateVolumeRequest, ImageRef, Machine, MachineAction,
-    MachineActionDisposition, MachineUsageFact, MachinesClient, DEFAULT_VOLUME_SIZE_GIB,
+    MachineActionDisposition, MachineUsageFact, MachinesClient, Volume, DEFAULT_VOLUME_SIZE_GIB,
 };
 use crate::template::{load_template, render_template};
 
@@ -324,7 +324,8 @@ pub async fn list_tenants(
     as_json: bool,
 ) -> Result<()> {
     let machines = list_managed_machines(client, tenant).await?;
-    let grouped = group_machines_by_tenant(machines);
+    let volume_sizes = list_volume_sizes(client).await?;
+    let grouped = group_machines_by_tenant(machines, &volume_sizes);
 
     if as_json {
         println!(
@@ -497,9 +498,19 @@ pub async fn list_usage_facts(
     client: &MachinesClient,
     tenant_filter: Option<&str>,
 ) -> Result<Vec<MachineUsageFact>> {
+    let volume_sizes = list_volume_sizes(client).await?;
     Ok(usage_facts_from_machines(
         list_managed_machines_with_options(client, tenant_filter, true).await?,
+        &volume_sizes,
     ))
+}
+
+async fn list_volume_sizes(client: &MachinesClient) -> Result<HashMap<String, u32>> {
+    let volumes: Vec<Volume> = client.list_volumes().await?;
+    Ok(volumes
+        .into_iter()
+        .filter_map(|volume| volume.size_gb.map(|size_gb| (volume.id, size_gb)))
+        .collect())
 }
 
 async fn list_managed_machines_with_options(
@@ -675,7 +686,10 @@ struct TenantMachine {
     checks: Value,
 }
 
-fn group_machines_by_tenant(machines: Vec<Machine>) -> Vec<TenantSummary> {
+fn group_machines_by_tenant(
+    machines: Vec<Machine>,
+    volume_sizes: &HashMap<String, u32>,
+) -> Vec<TenantSummary> {
     let mut grouped: BTreeMap<String, Vec<Machine>> = BTreeMap::new();
     for machine in machines {
         if let Some(tenant_id) = machine.metadata().get(TENANT_ID_KEY).cloned() {
@@ -688,11 +702,15 @@ fn group_machines_by_tenant(machines: Vec<Machine>) -> Vec<TenantSummary> {
 
     grouped
         .into_iter()
-        .map(|(tenant_id, machines)| summarize_tenant(tenant_id, machines))
+        .map(|(tenant_id, machines)| summarize_tenant(tenant_id, machines, volume_sizes))
         .collect()
 }
 
-fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary {
+fn summarize_tenant(
+    tenant_id: String,
+    machines: Vec<Machine>,
+    volume_sizes: &HashMap<String, u32>,
+) -> TenantSummary {
     let total = machines.len();
     let started = machines
         .iter()
@@ -710,7 +728,7 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
     let mut machine_rows = Vec::with_capacity(total);
 
     for machine in machines {
-        let usage_fact = machine.usage_fact();
+        let usage_fact = machine.usage_fact_with_volume_sizes(volume_sizes);
         if let Some(region) = machine.region.clone() {
             regions.insert(region);
         }
@@ -781,10 +799,13 @@ fn summarize_tenant(tenant_id: String, machines: Vec<Machine>) -> TenantSummary 
     }
 }
 
-fn usage_facts_from_machines(machines: Vec<Machine>) -> Vec<MachineUsageFact> {
+fn usage_facts_from_machines(
+    machines: Vec<Machine>,
+    volume_sizes: &HashMap<String, u32>,
+) -> Vec<MachineUsageFact> {
     let mut facts: Vec<_> = machines
         .into_iter()
-        .map(|machine| machine.usage_fact())
+        .map(|machine| machine.usage_fact_with_volume_sizes(volume_sizes))
         .collect();
     facts.sort_by(|left, right| left.machine_id.cmp(&right.machine_id));
     facts
@@ -941,12 +962,16 @@ pub async fn verify_soak_window(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{summarize_tenant, usage_facts_from_machines};
-    use crate::machines::{Machine, DEFAULT_VOLUME_SIZE_GIB};
+    use crate::machines::Machine;
     use serde_json::json;
 
     #[test]
     fn tenant_summary_machine_json_includes_usage_fact() {
+        let mut volume_sizes = HashMap::new();
+        volume_sizes.insert("vol-2".to_string(), 55);
         let summary = summarize_tenant(
             "tenant-1".to_string(),
             vec![Machine {
@@ -959,6 +984,7 @@ mod tests {
                 created_at: Some("2026-04-08T00:00:00Z".to_string()),
                 updated_at: Some("2026-04-08T01:00:00Z".to_string()),
                 image_ref: None,
+                events: vec![],
                 config: json!({
                     "metadata": {
                         "fly_vault.tenant_id": "tenant-1",
@@ -971,6 +997,7 @@ mod tests {
                 }),
                 checks: json!({}),
             }],
+            &volume_sizes,
         );
 
         assert_eq!(summary.machines.len(), 1);
@@ -986,60 +1013,62 @@ mod tests {
         assert_eq!(machine.usage_fact.volumes[0].volume_id, "vol-1");
         assert_eq!(machine.usage_fact.volumes[0].size_gib, 80);
         assert_eq!(machine.usage_fact.volumes[1].volume_id, "vol-2");
-        assert_eq!(
-            machine.usage_fact.volumes[1].size_gib,
-            DEFAULT_VOLUME_SIZE_GIB
-        );
+        assert_eq!(machine.usage_fact.volumes[1].size_gib, 55);
     }
 
     #[test]
     fn usage_facts_contract_is_flat_and_sorted() {
-        let facts = usage_facts_from_machines(vec![
-            Machine {
-                id: "machine-b".to_string(),
-                name: Some("worker-b".to_string()),
-                state: "destroyed".to_string(),
-                region: Some("sjc".to_string()),
-                instance_id: Some("instance-b".to_string()),
-                private_ip: Some("fdaa::2".to_string()),
-                created_at: Some("2026-04-08T00:00:00Z".to_string()),
-                updated_at: Some("2026-04-08T02:00:00Z".to_string()),
-                image_ref: None,
-                config: json!({
-                    "metadata": {
-                        "fly_vault.tenant_id": "tenant-1",
-                        "fly_vault.managed_by": "fly-vault-admin",
-                        "unbox_agent_id": "agent-b"
-                    },
-                    "mounts": [
-                        { "volume": "vol-b", "size_gb": 40 }
-                    ]
-                }),
-                checks: json!({}),
-            },
-            Machine {
-                id: "machine-a".to_string(),
-                name: Some("worker-a".to_string()),
-                state: "started".to_string(),
-                region: Some("sjc".to_string()),
-                instance_id: Some("instance-a".to_string()),
-                private_ip: Some("fdaa::1".to_string()),
-                created_at: Some("2026-04-08T00:00:00Z".to_string()),
-                updated_at: Some("2026-04-08T01:00:00Z".to_string()),
-                image_ref: None,
-                config: json!({
-                    "metadata": {
-                        "fly_vault.tenant_id": "tenant-1",
-                        "fly_vault.managed_by": "fly-vault-admin",
-                        "unbox_agent_id": "agent-a"
-                    },
-                    "mounts": [
-                        { "volume": "vol-a", "size_gb": 20 }
-                    ]
-                }),
-                checks: json!({}),
-            },
-        ]);
+        let facts = usage_facts_from_machines(
+            vec![
+                Machine {
+                    id: "machine-b".to_string(),
+                    name: Some("worker-b".to_string()),
+                    state: "destroyed".to_string(),
+                    region: Some("sjc".to_string()),
+                    instance_id: Some("instance-b".to_string()),
+                    private_ip: Some("fdaa::2".to_string()),
+                    created_at: Some("2026-04-08T00:00:00Z".to_string()),
+                    updated_at: Some("2026-04-08T02:00:00Z".to_string()),
+                    image_ref: None,
+                    events: vec![],
+                    config: json!({
+                        "metadata": {
+                            "fly_vault.tenant_id": "tenant-1",
+                            "fly_vault.managed_by": "fly-vault-admin",
+                            "unbox_agent_id": "agent-b"
+                        },
+                        "mounts": [
+                            { "volume": "vol-b", "size_gb": 40 }
+                        ]
+                    }),
+                    checks: json!({}),
+                },
+                Machine {
+                    id: "machine-a".to_string(),
+                    name: Some("worker-a".to_string()),
+                    state: "started".to_string(),
+                    region: Some("sjc".to_string()),
+                    instance_id: Some("instance-a".to_string()),
+                    private_ip: Some("fdaa::1".to_string()),
+                    created_at: Some("2026-04-08T00:00:00Z".to_string()),
+                    updated_at: Some("2026-04-08T01:00:00Z".to_string()),
+                    image_ref: None,
+                    events: vec![],
+                    config: json!({
+                        "metadata": {
+                            "fly_vault.tenant_id": "tenant-1",
+                            "fly_vault.managed_by": "fly-vault-admin",
+                            "unbox_agent_id": "agent-a"
+                        },
+                        "mounts": [
+                            { "volume": "vol-a", "size_gb": 20 }
+                        ]
+                    }),
+                    checks: json!({}),
+                },
+            ],
+            &HashMap::new(),
+        );
 
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].machine_id, "machine-a");
